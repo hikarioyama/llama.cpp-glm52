@@ -1,5 +1,8 @@
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   // [GLM-5.2] expose madvise(MADV_HUGEPAGE) on glibc
+#endif
 
 #include "ggml-backend.h"
 #include "ggml-impl.h"
@@ -88,6 +91,7 @@ uint64_t ggml_graph_next_uid(void) {
 #include <sys/wait.h>
 #if defined(__linux__)
 #include <sys/prctl.h>
+#include <sys/mman.h>   // [GLM-5.2] madvise(MADV_HUGEPAGE)
 #endif
 
 #if defined(__ANDROID__)
@@ -380,6 +384,39 @@ void * ggml_aligned_malloc(size_t size) {
         GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
         return NULL;
     }
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+    // [GLM-5.2] A1: back large anonymous buffers (the ~56 GB offloaded MoE experts) with
+    // transparent hugepages to collapse the STLB/page-walk tax. Gated by GGML_CPU_HUGEPAGE
+    // (=1 apply, =2 also log every large alloc). Two needed parts:
+    //   (1) clear an inherited PR_SET_THP_DISABLE — some launchers/runtimes set it, so children
+    //       get THPeligible=0 and never receive THP even under enabled=always (measured root cause);
+    //   (2) madvise the PAGE-ALIGNED subrange (posix_memalign only guarantees 64 B; madvise needs
+    //       a page-aligned start or returns EINVAL). Hint precedes first touch so faults map 2 MiB.
+    {
+        static int thp = -1;
+        if (thp < 0) {
+            const char * e = getenv("GGML_CPU_HUGEPAGE");
+            thp = e ? atoi(e) : 0;
+#if defined(PR_SET_THP_DISABLE)
+            if (thp) {
+                prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
+            }
+#endif
+        }
+        if (thp && size >= (2u << 20)) {
+            const uintptr_t ps   = (uintptr_t) sysconf(_SC_PAGESIZE);
+            const uintptr_t a    = (uintptr_t) aligned_memory;
+            const uintptr_t al   = (a + ps - 1) & ~(ps - 1);
+            const size_t    adj  = (size_t)(al - a);
+            const size_t    mlen = adj < size ? ((size - adj) & ~(size_t)(ps - 1)) : 0;
+            const int       mrc  = mlen ? madvise((void *) al, mlen, MADV_HUGEPAGE) : -1;
+            if (thp >= 2) {
+                fprintf(stderr, "[THP] aligned_malloc size=%8.1f MB madvise(len=%zu)=%d\n",
+                              size/(1024.0*1024.0), mlen, mrc);
+            }
+        }
+    }
+#endif
     return aligned_memory;
 #endif
 }
