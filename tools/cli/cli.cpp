@@ -12,9 +12,14 @@
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <thread>
+#include <vector>
 #include <signal.h>
 
 #if defined(_WIN32)
@@ -38,6 +43,91 @@ const char * LLAMA_ASCII_LOGO = R"(
 static std::atomic<bool> g_is_interrupted = false;
 static bool should_stop() {
     return g_is_interrupted.load();
+}
+
+struct glm_expert_dump_context {
+    FILE * file = nullptr;
+    std::vector<uint8_t> data;
+    int64_t next_tok = 0;
+    int64_t batch_tok_base = 0;
+    int last_layer = -1;
+    int fallback_layer = 0;
+
+    ~glm_expert_dump_context() {
+        if (file) {
+            fclose(file);
+        }
+    }
+};
+
+static bool glm_is_expert_dump_tensor(const ggml_tensor * t) {
+    static constexpr const char * prefix = "ffn_moe_topk";
+    static constexpr size_t prefix_len = 12;
+
+    return t != nullptr && t->type == GGML_TYPE_I32 && strncmp(t->name, prefix, prefix_len) == 0;
+}
+
+static int glm_expert_dump_layer(const char * name, int fallback) {
+    static constexpr const char * prefix = "ffn_moe_topk";
+    static constexpr size_t prefix_len = 12;
+
+    if (strncmp(name, prefix, prefix_len) != 0 || name[prefix_len] != '-') {
+        return fallback;
+    }
+
+    char * end = nullptr;
+    const long layer = strtol(name + prefix_len + 1, &end, 10);
+    if (end == name + prefix_len + 1 || *end != '\0' || layer < 0 || layer > INT32_MAX) {
+        return fallback;
+    }
+
+    return (int) layer;
+}
+
+static int32_t glm_expert_dump_i32(const uint8_t * data, const size_t * nb, int64_t i0, int64_t i1) {
+    int32_t v;
+    memcpy(&v, data + i1*nb[1] + i0*nb[0], sizeof(v));
+    return v;
+}
+
+static bool glm_expert_dump_cb_eval(ggml_tensor * t, bool ask, void * user_data) {
+    auto * dump = (glm_expert_dump_context *) user_data;
+    if (dump == nullptr || dump->file == nullptr) {
+        return true;
+    }
+
+    const bool want = glm_is_expert_dump_tensor(t);
+    if (ask) {
+        return want;
+    }
+    if (!want) {
+        return true;
+    }
+
+    const size_t n_bytes = ggml_nbytes(t);
+    dump->data.resize(n_bytes);
+    ggml_backend_tensor_get(t, dump->data.data(), 0, n_bytes);
+
+    const int64_t n_expert_used = t->ne[0];
+    const int64_t n_tokens = t->ne[1];
+    const int layer = glm_expert_dump_layer(t->name, dump->fallback_layer++);
+
+    if (dump->last_layer < 0 || layer <= dump->last_layer) {
+        dump->batch_tok_base = dump->next_tok;
+        dump->next_tok += n_tokens;
+    }
+    dump->last_layer = layer;
+
+    for (int64_t it = 0; it < n_tokens; ++it) {
+        fprintf(dump->file, "{\"tok\":%" PRId64 ",\"layer\":%d,\"experts\":[", dump->batch_tok_base + it, layer);
+        for (int64_t ie = 0; ie < n_expert_used; ++ie) {
+            fprintf(dump->file, "%s%d", ie == 0 ? "" : ",", (int) glm_expert_dump_i32(dump->data.data(), t->nb, ie, it));
+        }
+        fprintf(dump->file, "]}\n");
+    }
+    fflush(dump->file);
+
+    return true;
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
@@ -351,6 +441,18 @@ int main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
+    }
+
+    glm_expert_dump_context expert_dump;
+    if (const char * path = std::getenv("GLM_DUMP_EXPERTS"); path != nullptr && path[0] != '\0') {
+        expert_dump.file = fopen(path, "a");
+        if (expert_dump.file == nullptr) {
+            fprintf(stderr, "error: failed to open GLM_DUMP_EXPERTS path '%s'\n", path);
+            return 1;
+        }
+
+        params.cb_eval           = glm_expert_dump_cb_eval;
+        params.cb_eval_user_data = &expert_dump;
     }
 
     // TODO: maybe support it later?

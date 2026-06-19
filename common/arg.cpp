@@ -257,6 +257,13 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // also expose the device's pinned host buffer type (e.g. "CUDA_Host"), so that
+        // -ot can place offloaded expert weights in pinned host memory. this lets the
+        // scheduler's used-expert H2D copy path run as async pinned copies (GLM-5.2 offload).
+        auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft) {
+            buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

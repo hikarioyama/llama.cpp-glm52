@@ -1504,6 +1504,101 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // ---- GLM-5.2 CPU∥GPU expert split (env LLAMA_MOE_CPU_SPLIT=k) -------------------
+    // For offloaded (host-resident) MoE layers in decode, split the top-k experts by
+    // position: the first (n_used-k) experts compute on GPU (host weights copied via the
+    // scheduler's copy_experts path), the last k compute on CPU (reads host RAM). The two
+    // independent branches run CONCURRENTLY (proven ~86-99% overlap, see CPU_GPU_SPLIT_SPEC).
+    // Recipe that makes the scheduler actually overlap:
+    //   (1) slice selected_experts (n_used axis) -> same 256-expert tensor, NO 2x compute,
+    //       ids stay real expert-ids so copy_experts copies only the used subset.
+    //   (2) pre-stage `cur` onto CPU as its own EARLY split (cont, pinned CPU, expanded
+    //       first) so the CPU branch never syncs the GPU for its input.
+    //   (3) pin CPU branch nodes to backend_cpu; build+pin GPU branch first (split order).
+    //   (4) pin the JOIN (final add) to the GPU backend so it is a separate trailing split
+    //       (otherwise the scheduler folds the add into the CPU split and its GPU input
+    //       forces a synchronize at that split's start = full serialization).
+    int moe_cpu_k = 0;
+    if (const char * e = getenv("LLAMA_MOE_CPU_SPLIT")) {
+        moe_cpu_k = atoi(e);
+    }
+    const bool experts_host = up_exps && up_exps->buffer && ggml_backend_buffer_is_host(up_exps->buffer);
+    const bool moe_split = moe_cpu_k > 0 && moe_cpu_k < n_expert_used &&
+        sched && backend_cpu && experts_host && !weight_before_ffn &&
+        type_op == LLM_FFN_SILU && gate_exps && !gate_up_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        n_tokens == 1; // decode only (strided id-view is contiguous at n_tok==1)
+
+    if (moe_split) {
+        { static bool once = false; if (!once) { once = true;
+            fprintf(stderr, "[MOE_CPU_SPLIT] active: n_cpu=%d n_gpu=%d n_used=%d (per host-offloaded MoE layer)\n",
+                    (int) moe_cpu_k, (int) (n_expert_used - moe_cpu_k), (int) n_expert_used); } }
+        ggml_backend_t be_gpu = ggml_backend_sched_get_backend(sched, 0); // 0 = highest-priority GPU
+        const int64_t n_cpu = moe_cpu_k;
+        const int64_t n_gpu = n_expert_used - n_cpu;
+        ggml_tensor * inp = cur; // [n_embd, 1, n_tokens]
+
+        // (2) pre-stage EVERY GPU-produced input the CPU branch needs (inp, ids, weights)
+        // onto CPU as early splits, so the CPU branch has NO cross-backend input at compute
+        // time (otherwise each GPU->CPU fetch syncs the GPU = serializes with the GPU branch).
+        ggml_tensor * inp_cpu = ggml_cont(ctx0, inp);
+        ggml_backend_sched_set_tensor_backend(sched, inp_cpu, backend_cpu);
+        ggml_build_forward_expand(gf, inp_cpu);
+        ggml_tensor * sel_all_cpu = ggml_cont(ctx0, selected_experts); // [n_used, n_tok] on CPU
+        ggml_backend_sched_set_tensor_backend(sched, sel_all_cpu, backend_cpu);
+        ggml_build_forward_expand(gf, sel_all_cpu);
+        ggml_tensor * w_all_cpu = ggml_cont(ctx0, weights);            // [1, n_used, n_tok] on CPU
+        ggml_backend_sched_set_tensor_backend(sched, w_all_cpu, backend_cpu);
+        ggml_build_forward_expand(gf, w_all_cpu);
+
+        // (1) id slices along n_used axis (contiguous at n_tokens==1).
+        // GPU branch slices the GPU-resident tensors; CPU branch slices the CPU-staged copies.
+        ggml_tensor * sel_gpu = ggml_view_2d(ctx0, selected_experts, n_gpu, n_tokens,
+                                             selected_experts->nb[1], 0);
+        ggml_tensor * sel_cpu = ggml_view_2d(ctx0, sel_all_cpu, n_cpu, n_tokens,
+                                             sel_all_cpu->nb[1], n_gpu*sel_all_cpu->nb[0]);
+        ggml_tensor * w_gpu = ggml_view_3d(ctx0, weights, 1, n_gpu, n_tokens,
+                                           weights->nb[1], weights->nb[2], 0);
+        ggml_tensor * w_cpu = ggml_view_3d(ctx0, w_all_cpu, 1, n_cpu, n_tokens,
+                                           w_all_cpu->nb[1], w_all_cpu->nb[2], n_gpu*w_all_cpu->nb[1]);
+
+        auto build_branch = [&](ggml_tensor * x, ggml_tensor * sel, ggml_tensor * w,
+                                int64_t cnt, ggml_backend_t be) -> ggml_tensor * {
+            ggml_tensor * b_up   = build_lora_mm_id(up_exps,   x, sel);     // [n_ff, cnt, n_tok]
+            ggml_tensor * b_gate = build_lora_mm_id(gate_exps, x, sel);     // [n_ff, cnt, n_tok]
+            ggml_tensor * b_swi  = ggml_swiglu_split(ctx0, b_gate, b_up);   // silu(gate)*up
+            ggml_tensor * b_down = build_lora_mm_id(down_exps, b_swi, sel); // [n_embd, cnt, n_tok]
+            ggml_tensor * b_exp  = ggml_mul(ctx0, b_down, w);              // [n_embd, cnt, n_tok]
+            ggml_backend_sched_set_tensor_backend(sched, b_up,   be);
+            ggml_backend_sched_set_tensor_backend(sched, b_gate, be);
+            ggml_backend_sched_set_tensor_backend(sched, b_swi,  be);
+            ggml_backend_sched_set_tensor_backend(sched, b_down, be);
+            ggml_backend_sched_set_tensor_backend(sched, b_exp,  be);
+            // sum the cnt expert views
+            ggml_tensor * acc = ggml_view_2d(ctx0, b_exp, n_embd, n_tokens, b_exp->nb[2], 0);
+            for (int64_t i = 1; i < cnt; i++) {
+                ggml_tensor * v = ggml_view_2d(ctx0, b_exp, n_embd, n_tokens, b_exp->nb[2], i*b_exp->nb[1]);
+                acc = ggml_add(ctx0, acc, v);
+                ggml_backend_sched_set_tensor_backend(sched, acc, be);
+            }
+            return acc;
+        };
+
+        // (3) GPU branch FIRST (split order), pinned to GPU; then CPU branch reads inp_cpu
+        ggml_tensor * part_gpu = build_branch(inp,     sel_gpu, w_gpu, n_gpu, be_gpu);
+        ggml_build_forward_expand(gf, part_gpu);
+        ggml_tensor * part_cpu = build_branch(inp_cpu, sel_cpu, w_cpu, n_cpu, backend_cpu);
+        ggml_build_forward_expand(gf, part_cpu);
+
+        // (4) join pinned to GPU => separate trailing split, no GPU-sync inside CPU split
+        ggml_tensor * moe_out = ggml_add(ctx0, part_gpu, part_cpu);
+        ggml_backend_sched_set_tensor_backend(sched, moe_out, be_gpu);
+        cb(moe_out, "ffn_moe_out", il);
+        return moe_out;
+    }
+    // ---- end CPU∥GPU expert split --------------------------------------------------
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);

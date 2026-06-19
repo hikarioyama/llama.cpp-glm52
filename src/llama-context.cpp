@@ -320,6 +320,13 @@ llama_context::llama_context(
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
+        // GLM-5.2 CPU∥GPU split needs n_copies>1 (events) so cross-backend handoffs use
+        // async cudaStreamWaitEvent instead of blocking ggml_backend_synchronize. The default
+        // disables pipeline parallelism when -ot is used; force it back on for the split.
+        if (getenv("LLAMA_FORCE_PP") && model.n_devices() > 1) {
+            pipeline_parallel = true;
+        }
+
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
