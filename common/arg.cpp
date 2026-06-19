@@ -10,6 +10,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
+#include "ggml-cpu.h" // for ggml_backend_dev_get_extra_bufts_t (CPU_REPACK exposure in -ot)
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -263,6 +264,20 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         auto * host_buft = ggml_backend_dev_host_buffer_type(dev);
         if (host_buft) {
             buft_list[ggml_backend_buft_name(host_buft)] = host_buft;
+        }
+    }
+
+    // also expose the CPU device's EXTRA buffer types (e.g. "CPU_REPACK") so -ot can force
+    // offloaded MoE expert weights into the repacked q2_Kx8 / q4_Kx8 layout, which the CPU
+    // backend computes with the fast interleaved GEMV instead of the slow per-block vec_dot.
+    if (auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU)) {
+        auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra) {
+            for (auto * eb = get_extra(cpu_dev); eb && *eb; ++eb) {
+                buft_list[ggml_backend_buft_name(*eb)] = *eb;
+            }
         }
     }
 
