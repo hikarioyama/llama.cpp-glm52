@@ -1606,16 +1606,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // (1) id slices along n_used axis (contiguous at n_tokens==1).
         // GPU branch slices the GPU-resident tensors; CPU branch slices the CPU-staged copies.
+        // GPU0 slices the GPU-resident (CUDA0) tensors; CPU slices the host-staged copies.
+        // GPU1 slices the HOST-staged copies too (NOT the CUDA0-resident ones): if GPU1 read
+        // sel/w/inp from CUDA0, the P2P CUDA0->CUDA1 input copies queue on CUDA0's stream behind
+        // the GPU0 branch => CUDA1 serializes after CUDA0 (no overlap). Reading from host makes
+        // CUDA1 fully independent (its own host->CUDA1 PCIe link), so both GPUs run concurrently.
         ggml_tensor * sel_g0 = ggml_view_2d(ctx0, selected_experts, n_g0, n_tokens,
                                              selected_experts->nb[1], 0);
-        ggml_tensor * sel_g1 = dual ? ggml_view_2d(ctx0, selected_experts, n_g1, n_tokens,
-                                             selected_experts->nb[1], n_g0*selected_experts->nb[0]) : nullptr;
+        ggml_tensor * sel_g1 = dual ? ggml_view_2d(ctx0, sel_all_cpu, n_g1, n_tokens,
+                                             sel_all_cpu->nb[1], n_g0*sel_all_cpu->nb[0]) : nullptr;
         ggml_tensor * sel_cpu = ggml_view_2d(ctx0, sel_all_cpu, n_cpu, n_tokens,
                                              sel_all_cpu->nb[1], n_gpu*sel_all_cpu->nb[0]);
         ggml_tensor * w_g0 = ggml_view_3d(ctx0, weights, 1, n_g0, n_tokens,
                                            weights->nb[1], weights->nb[2], 0);
-        ggml_tensor * w_g1 = dual ? ggml_view_3d(ctx0, weights, 1, n_g1, n_tokens,
-                                           weights->nb[1], weights->nb[2], n_g0*weights->nb[1]) : nullptr;
+        ggml_tensor * w_g1 = dual ? ggml_view_3d(ctx0, w_all_cpu, 1, n_g1, n_tokens,
+                                           w_all_cpu->nb[1], w_all_cpu->nb[2], n_g0*w_all_cpu->nb[1]) : nullptr;
         ggml_tensor * w_cpu = ggml_view_3d(ctx0, w_all_cpu, 1, n_cpu, n_tokens,
                                            w_all_cpu->nb[1], w_all_cpu->nb[2], n_gpu*w_all_cpu->nb[1]);
 
@@ -1648,7 +1653,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, part_g0);
         ggml_tensor * part_g1 = nullptr;
         if (dual) {
-            part_g1 = build_branch(inp, sel_g1, w_g1, n_g1, be_gpu1);
+            part_g1 = build_branch(inp_cpu, sel_g1, w_g1, n_g1, be_gpu1); // inp_cpu = host (independent of CUDA0)
             ggml_build_forward_expand(gf, part_g1);
         }
         ggml_tensor * part_cpu = build_branch(inp_cpu, sel_cpu, w_cpu, n_cpu, backend_cpu);
