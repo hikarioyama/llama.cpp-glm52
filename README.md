@@ -1,3 +1,12 @@
+> ## ⚡ Fork: GLM-5.2 fast local inference (CPU∥GPU MoE expert offload)
+>
+> This is an **experimental llama.cpp fork** chasing fast single-stream **GLM-5.2**
+> (754B MoE, UD-Q2_K_XL) decode when the experts (224 GB) exceed VRAM (192 GB) and must be
+> offloaded to a Threadripper Zen5 CPU. We are **actively hunting for speedup hacks — ideas/PRs welcome.**
+> See **[`GLM52-SPEEDUP.md`](GLM52-SPEEDUP.md)** and the write-up repo
+> **https://github.com/hikarioyama/glm52-speedup**. Branch: `glm52-cpu-gpu-moe-split`.
+> GLM-5.2-specific changes are dedicated to the **public domain**; upstream llama.cpp remains MIT.
+
 # llama.cpp
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
