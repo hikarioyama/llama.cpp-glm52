@@ -1531,12 +1531,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         n_tokens == 1; // decode only (strided id-view is contiguous at n_tok==1)
 
     if (moe_split) {
-        { static bool once = false; if (!once) { once = true;
-            fprintf(stderr, "[MOE_CPU_SPLIT] active: n_cpu=%d n_gpu=%d n_used=%d (per host-offloaded MoE layer)\n",
-                    (int) moe_cpu_k, (int) (n_expert_used - moe_cpu_k), (int) n_expert_used); } }
         ggml_backend_t be_gpu = ggml_backend_sched_get_backend(sched, 0); // 0 = highest-priority GPU
+
+        // Optional dual-GPU: split the GPU-side experts across BOTH GPUs so the per-token
+        // expert COPY uses both PCIe links (the GPU branch is copy-bound on a single link;
+        // measured GPU-wait 18ms >> CPU branch 10.5ms => the copy is the bottleneck).
+        // sched->backends = [GPU0, GPU1, ..., CPU]; backend index 1 is the 2nd GPU if present.
+        static const bool want_dual = []{ const char * e = getenv("LLAMA_MOE_DUAL_GPU"); return e && atoi(e) > 0; }();
+        ggml_backend_t be_gpu1 = nullptr;
+        if (want_dual) {
+            const int nb = ggml_backend_sched_get_n_backends(sched);
+            if (nb >= 3) {
+                ggml_backend_t cand = ggml_backend_sched_get_backend(sched, 1);
+                if (cand != backend_cpu &&
+                    ggml_backend_dev_type(ggml_backend_get_device(cand)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    be_gpu1 = cand;
+                }
+            }
+        }
+
         const int64_t n_cpu = moe_cpu_k;
         const int64_t n_gpu = n_expert_used - n_cpu;
+        // dual: split GPU experts CUDA0=[0:n_g0) CUDA1=[n_g0:n_gpu); CUDA0 gets the ceil half.
+        const bool    dual = be_gpu1 && n_gpu >= 2;
+        const int64_t n_g1 = dual ? (n_gpu / 2) : 0;
+        const int64_t n_g0 = n_gpu - n_g1;
+        { static bool once = false; if (!once) { once = true;
+            fprintf(stderr, "[MOE_CPU_SPLIT] active: n_cpu=%d n_gpu0=%d n_gpu1=%d n_used=%d dual=%d (per host-offloaded MoE layer)\n",
+                    (int) n_cpu, (int) n_g0, (int) n_g1, (int) n_expert_used, (int) dual); } }
         ggml_tensor * inp = cur; // [n_embd, 1, n_tokens]
 
         // (2) pre-stage EVERY GPU-produced input the CPU branch needs (inp, ids, weights)
@@ -1554,12 +1576,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // (1) id slices along n_used axis (contiguous at n_tokens==1).
         // GPU branch slices the GPU-resident tensors; CPU branch slices the CPU-staged copies.
-        ggml_tensor * sel_gpu = ggml_view_2d(ctx0, selected_experts, n_gpu, n_tokens,
+        ggml_tensor * sel_g0 = ggml_view_2d(ctx0, selected_experts, n_g0, n_tokens,
                                              selected_experts->nb[1], 0);
+        ggml_tensor * sel_g1 = dual ? ggml_view_2d(ctx0, selected_experts, n_g1, n_tokens,
+                                             selected_experts->nb[1], n_g0*selected_experts->nb[0]) : nullptr;
         ggml_tensor * sel_cpu = ggml_view_2d(ctx0, sel_all_cpu, n_cpu, n_tokens,
                                              sel_all_cpu->nb[1], n_gpu*sel_all_cpu->nb[0]);
-        ggml_tensor * w_gpu = ggml_view_3d(ctx0, weights, 1, n_gpu, n_tokens,
+        ggml_tensor * w_g0 = ggml_view_3d(ctx0, weights, 1, n_g0, n_tokens,
                                            weights->nb[1], weights->nb[2], 0);
+        ggml_tensor * w_g1 = dual ? ggml_view_3d(ctx0, weights, 1, n_g1, n_tokens,
+                                           weights->nb[1], weights->nb[2], n_g0*weights->nb[1]) : nullptr;
         ggml_tensor * w_cpu = ggml_view_3d(ctx0, w_all_cpu, 1, n_cpu, n_tokens,
                                            w_all_cpu->nb[1], w_all_cpu->nb[2], n_gpu*w_all_cpu->nb[1]);
 
@@ -1585,15 +1611,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             return acc;
         };
 
-        // (3) GPU branch FIRST (split order), pinned to GPU; then CPU branch reads inp_cpu
-        ggml_tensor * part_gpu = build_branch(inp,     sel_gpu, w_gpu, n_gpu, be_gpu);
-        ggml_build_forward_expand(gf, part_gpu);
+        // (3) GPU branch(es) FIRST (split order), pinned to GPU; then CPU branch reads inp_cpu.
+        // In dual mode CUDA0 and CUDA1 each copy+compute their expert share over their own PCIe
+        // link concurrently, halving the copy-bound GPU-branch wall time.
+        ggml_tensor * part_g0 = build_branch(inp, sel_g0, w_g0, n_g0, be_gpu);
+        ggml_build_forward_expand(gf, part_g0);
+        ggml_tensor * part_g1 = nullptr;
+        if (dual) {
+            part_g1 = build_branch(inp, sel_g1, w_g1, n_g1, be_gpu1);
+            ggml_build_forward_expand(gf, part_g1);
+        }
         ggml_tensor * part_cpu = build_branch(inp_cpu, sel_cpu, w_cpu, n_cpu, backend_cpu);
         ggml_build_forward_expand(gf, part_cpu);
 
-        // (4) join pinned to GPU => separate trailing split, no GPU-sync inside CPU split
-        ggml_tensor * moe_out = ggml_add(ctx0, part_gpu, part_cpu);
+        // (4) join pinned to GPU0 => separate trailing split(s), no GPU-sync inside CPU split.
+        // part_g1 (CUDA1) reaches the GPU0 add via P2P (iommu=pt); part_cpu via CPU->GPU0.
+        ggml_tensor * moe_out = ggml_add(ctx0, part_g0, part_cpu);
         ggml_backend_sched_set_tensor_backend(sched, moe_out, be_gpu);
+        if (dual) {
+            moe_out = ggml_add(ctx0, moe_out, part_g1);
+            ggml_backend_sched_set_tensor_backend(sched, moe_out, be_gpu);
+        }
         cb(moe_out, "ffn_moe_out", il);
         return moe_out;
     }
