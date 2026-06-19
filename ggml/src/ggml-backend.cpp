@@ -1806,12 +1806,21 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;
 
+    // [MOE_CPU_SPLIT] Allocate per-backend events even at n_copies==1 when the GLM-5.2
+    // CPU∥GPU MoE split is active. Events convert the WAR guard in compute_splits from a
+    // host-blocking ggml_backend_synchronize (which flushes the GPU pipeline ~6x/layer and
+    // kills CPU∥GPU overlap) into a non-blocking stream wait (ggml_backend_event_wait).
+    // At n_copies==1 there is one event per backend (event_new returns NULL for CPU = safe);
+    // the WAR ordering it enforces is already guaranteed by same-stream FIFO, so the wait is
+    // a correctness-preserving no-op on the host. Gated on the split env so non-split runs
+    // keep stock behavior (no events allocated, zero risk of regression).
+    static const bool moe_split_events = []{ const char * e = getenv("LLAMA_MOE_CPU_SPLIT"); return e && atoi(e) > 0; }();
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
+        if (sched->n_copies > 1 || moe_split_events) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
