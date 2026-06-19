@@ -17,6 +17,37 @@
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+#include <sys/stat.h>
+
+// Runtime-tunable GLM-5.2 MoE split control. If env LLAMA_MOE_CTL names a file, read
+// "k dual" from it (re-read only when its mtime changes => cheap stat per graph build),
+// so k and dual-GPU can be swept against ONE persistent server load without reloading the
+// 237GB model. Falls back to the static env vars LLAMA_MOE_CPU_SPLIT / LLAMA_MOE_DUAL_GPU
+// when LLAMA_MOE_CTL is unset (backward compatible).
+static void llama_moe_split_ctl(int * out_k, bool * out_dual) {
+    static const char * ctl = getenv("LLAMA_MOE_CTL");
+    if (!ctl) {
+        const char * e = getenv("LLAMA_MOE_CPU_SPLIT");
+        const char * d = getenv("LLAMA_MOE_DUAL_GPU");
+        *out_k    = e ? atoi(e) : 0;
+        *out_dual = d && atoi(d) > 0;
+        return;
+    }
+    static int  cached_k = 0;
+    static bool cached_dual = false;
+    static long cached_mtime = -2;
+    struct stat st;
+    if (stat(ctl, &st) == 0 && (long) st.st_mtime != cached_mtime) {
+        cached_mtime = (long) st.st_mtime;
+        FILE * f = fopen(ctl, "r");
+        if (f) {
+            int k = 0, d = 0;
+            if (fscanf(f, "%d %d", &k, &d) >= 1) { cached_k = k; cached_dual = (d > 0); }
+            fclose(f);
+        }
+    }
+    *out_k = cached_k; *out_dual = cached_dual;
+}
 
 // dedup helpers
 
@@ -1519,9 +1550,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //       (otherwise the scheduler folds the add into the CPU split and its GPU input
     //       forces a synchronize at that split's start = full serialization).
     int moe_cpu_k = 0;
-    if (const char * e = getenv("LLAMA_MOE_CPU_SPLIT")) {
-        moe_cpu_k = atoi(e);
-    }
+    bool moe_want_dual = false;
+    llama_moe_split_ctl(&moe_cpu_k, &moe_want_dual);
     const bool experts_host = up_exps && up_exps->buffer && ggml_backend_buffer_is_host(up_exps->buffer);
     const bool moe_split = moe_cpu_k > 0 && moe_cpu_k < n_expert_used &&
         sched && backend_cpu && experts_host && !weight_before_ffn &&
@@ -1537,7 +1567,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // expert COPY uses both PCIe links (the GPU branch is copy-bound on a single link;
         // measured GPU-wait 18ms >> CPU branch 10.5ms => the copy is the bottleneck).
         // sched->backends = [GPU0, GPU1, ..., CPU]; backend index 1 is the 2nd GPU if present.
-        static const bool want_dual = []{ const char * e = getenv("LLAMA_MOE_DUAL_GPU"); return e && atoi(e) > 0; }();
+        const bool want_dual = moe_want_dual;
         ggml_backend_t be_gpu1 = nullptr;
         if (want_dual) {
             const int nb = ggml_backend_sched_get_n_backends(sched);
