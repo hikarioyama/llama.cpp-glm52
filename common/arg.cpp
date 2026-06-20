@@ -2495,6 +2495,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--enable-mtp"},
+        string_format("load GLM-5.2 nextn/MTP head tensors (experimental) (default: %s)", params.enable_mtp ? "true" : "false"),
+        [](common_params & params) {
+            params.enable_mtp = true;
+        }
+    ));
+    add_opt(common_arg(
         {"--override-kv"}, "KEY=TYPE:VALUE,...",
         "advanced option to override model metadata by key. to specify multiple overrides, either use comma-separated values.\n"
         "types: int, float, bool, str. example: --override-kv tokenizer.ggml.add_bos_token=bool:false,tokenizer.ggml.add_eos_token=bool:false",

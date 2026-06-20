@@ -316,6 +316,7 @@ extern "C" {
         bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
         bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data
+        bool enable_mtp;      // load the MTP / nextn prediction head tensors (GLM-5.2)
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
@@ -970,6 +971,16 @@ extern "C" {
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    // MTP self-speculation (GLM-5.2 nextn) — research hooks driving the K=1 self-spec loop.
+    // Process-global (the decode driver is single-threaded), read at graph-build time:
+    //   * llama_mtp_set_draft_mode(true): the NEXT decode builds the "draft-only" topology
+    //       (skip the main layers, run only the nextn block on the injected hidden);
+    //       false restores the normal full-graph topology. Keyed into the graph-reuse cache.
+    //   * llama_mtp_set_hidden(): host pre-norm hidden {n_embd, n_tokens} injected into the
+    //       draft forward (must be set before each draft decode; data must outlive the decode).
+    LLAMA_API void llama_mtp_set_draft_mode(bool draft_only);
+    LLAMA_API void llama_mtp_set_hidden(const float * data, int64_t n_embd, int64_t n_tokens);
 
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results

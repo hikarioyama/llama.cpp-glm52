@@ -2173,6 +2173,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.graph_variant =*/ llama_mtp_get_draft_mode() ? 1u : 0u, // MTP draft-only topology key
     };
 }
 

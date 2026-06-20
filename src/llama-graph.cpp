@@ -108,6 +108,38 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
+// ---- MTP self-speculation (GLM-5.2 nextn) state --------------------------------------------------
+// Single-threaded decode driver (the mtp-alpha tool) sets these right before each llama_decode:
+//   * draft mode selects the "draft-only" topology (glm-dsa skips main layers, runs only nextn);
+//   * hidden holds the host-side pre-norm hidden injected into the draft forward.
+// graph_variant (set in llama_context::graph_params) keys the graph-reuse cache off the draft flag,
+// so a normal-topology cached graph is never silently reused for a draft forward (or vice versa).
+static bool          g_mtp_draft_only      = false;
+static const float * g_mtp_hidden_data     = nullptr;
+static int64_t       g_mtp_hidden_n_embd   = 0;
+static int64_t       g_mtp_hidden_n_tokens = 0;
+
+bool llama_mtp_get_draft_mode() { return g_mtp_draft_only; }
+
+void llama_mtp_set_draft_mode(bool draft_only) { g_mtp_draft_only = draft_only; }
+
+void llama_mtp_set_hidden(const float * data, int64_t n_embd, int64_t n_tokens) {
+    g_mtp_hidden_data     = data;
+    g_mtp_hidden_n_embd   = n_embd;
+    g_mtp_hidden_n_tokens = n_tokens;
+}
+
+void llm_graph_input_mtp_hidden::set_input(const llama_ubatch * ubatch) {
+    if (!h) {
+        return;
+    }
+    GGML_ASSERT(g_mtp_hidden_data != nullptr && "llama_mtp_set_hidden() must be called before a draft forward");
+    GGML_ASSERT(g_mtp_hidden_n_embd == n_embd);
+    const int64_t n_tokens = ubatch->n_tokens;
+    GGML_ASSERT(g_mtp_hidden_n_tokens >= n_tokens);
+    ggml_backend_tensor_set(h, g_mtp_hidden_data, 0, n_tokens*n_embd*ggml_element_size(h));
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1954,6 +1986,20 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     // make sure the produced embeddings are immediately materialized in the ggml graph
     // ref: https://github.com/ggml-org/llama.cpp/pull/18599
     ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_mtp_hidden() const {
+    auto inp = std::make_unique<llm_graph_input_mtp_hidden>(hparams.n_embd);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, ubatch.n_tokens);
+    ggml_set_input(inp->h);
+    cb(inp->h, "mtp_hidden", -1);
+
+    ggml_tensor * cur = inp->h;
+
+    res->add_input(std::move(inp));
 
     return cur;
 }

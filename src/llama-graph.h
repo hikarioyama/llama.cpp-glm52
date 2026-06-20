@@ -75,6 +75,10 @@ struct llama_cross {
 
 struct llm_graph_params;
 
+// MTP self-speculation (GLM-5.2 nextn) — internal accessors. The host-facing setters are the
+// LLAMA_API llama_mtp_set_draft_mode() / llama_mtp_set_hidden() (see llama.h); these read the state.
+bool llama_mtp_get_draft_mode();
+
 //
 // llm_graph_input
 //
@@ -116,6 +120,22 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+
+    const int64_t n_embd = 0;
+};
+
+// MTP self-speculation (GLM-5.2 nextn). Injects a host-side pre-norm hidden state for the
+// "draft-only" forward, which skips the main layers (0..n-2) and runs only the nextn block.
+// The host data pointer + dims are set via llama_mtp_set_hidden() right before the decode; the
+// draft-only topology is selected via llama_mtp_set_draft_mode() (read at graph-build time).
+class llm_graph_input_mtp_hidden : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_hidden(int64_t n_embd) : n_embd(n_embd) {}
+    virtual ~llm_graph_input_mtp_hidden() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * h = nullptr; // F32 [n_embd, n_tokens]
 
     const int64_t n_embd = 0;
 };
@@ -568,6 +588,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // MTP self-spec: discriminates the "draft-only" topology (skip main layers) from the normal
+    // topology so a cached graph is never reused across the two even at identical ubatch shape.
+    uint32_t graph_variant = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -628,6 +652,7 @@ struct llm_graph_params {
             cparams.causal_attn == other.cparams.causal_attn &&
             arch  == other.arch  &&
             gtype == other.gtype &&
+            graph_variant == other.graph_variant &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -878,6 +903,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    ggml_tensor * build_inp_mtp_hidden() const; // MTP self-spec: injected pre-norm hidden {n_embd, n_tokens}
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
