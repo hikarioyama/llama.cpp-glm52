@@ -1370,6 +1370,38 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// [GLM-5.2 fused weighted-expert-sum] One CPU custom op that replaces the tail of build_moe_ffn
+// for the CPU-offloaded decode path: (experts *= routing weights) + (n_expert_used-1 element-wise
+// adds). On the 22 host-offloaded MoE layers this collapses ~8 barriered graph nodes per layer into
+// ONE op (a single threadpool barrier), recovering the per-split dispatch overhead measured as the
+// in-graph 242->107 GB/s gap (cmp_cpu ~19ms vs ~9.6ms isolated). Bit-identical to the add-chain:
+// out[r,t] = sum_{j=0..n_used-1} experts[r,j,t] * weights[0,j,t], summed in expert order (adding to
+// 0.0f first is exact for finite floats). args: [experts f32 {n_embd,n_used,n_tok}, weights f32 {1,n_used,n_tok}].
+static void glm_moe_weighted_sum(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
+    (void) userdata;
+    const struct ggml_tensor * e = dst->src[0]; // experts {n_embd, n_used, n_tok} f32
+    const struct ggml_tensor * w = dst->src[1]; // weights {1, n_used, n_tok}      f32
+    const int64_t ne0 = dst->ne[0]; // n_embd
+    const int64_t nt  = dst->ne[1]; // n_tok
+    const int64_t nu  = e->ne[1];   // n_used
+    const int64_t r0  = (ne0 *  (int64_t) ith     ) / nth;
+    const int64_t r1  = (ne0 * ((int64_t) ith + 1)) / nth;
+    for (int64_t t = 0; t < nt; ++t) {
+        const char * eb = (const char *) e->data   + t * e->nb[2];
+        const char * wb = (const char *) w->data   + t * w->nb[2];
+        char       * db = (char       *) dst->data + t * dst->nb[1];
+        for (int64_t r = r0; r < r1; ++r) {
+            float acc = 0.0f;
+            for (int64_t j = 0; j < nu; ++j) {
+                const float ev = *(const float *)(eb + r * e->nb[0] + j * e->nb[1]);
+                const float wv = *(const float *)(wb +                j * w->nb[1]);
+                acc += ev * wv;
+            }
+            *(float *)(db + r * dst->nb[0]) = acc;
+        }
+    }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -1865,39 +1897,55 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_scaled", il);
     }
 
-    if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
-        cb(experts, "ffn_moe_weighted", il);
-    }
+    // [GLM-5.2 fused weighted-expert-sum] On the CPU-offloaded decode path, fuse the routing-weight
+    // multiply + the n_expert_used-1 accumulation adds into ONE custom CPU op (one threadpool barrier
+    // instead of ~8). GGML_OP_CUSTOM is CPU-only, so gating to host-resident experts keeps every
+    // GPU-resident layer on its existing (GPU) add-chain. Bit-identical (see glm_moe_weighted_sum).
+    const bool down_experts_host = down_exps && down_exps->buffer && ggml_backend_buffer_is_host(down_exps->buffer);
+    const bool use_fused_wsum = down_experts_host && !weight_before_ffn && weights != nullptr &&
+        n_tokens <= 2 && (int64_t) hparams.n_expert_used == n_expert_used;
 
-    ggml_build_forward_expand(gf, experts);
-
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
-
-    assert(n_expert_used > 0);
-
-    // order the views before the adds
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
-
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
-
-    // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    ggml_tensor * moe_out = cur_experts[0];
-
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
-
+    ggml_tensor * moe_out;
+    if (use_fused_wsum) {
+        ggml_tensor * wsum_args[2] = { experts, weights };
+        moe_out = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1,
+                                 wsum_args, 2, glm_moe_weighted_sum, GGML_N_TASKS_MAX, nullptr);
         ggml_build_forward_expand(gf, moe_out);
-    }
+    } else {
+        if (!weight_before_ffn) {
+            experts = ggml_mul(ctx0, experts, weights);
+            cb(experts, "ffn_moe_weighted", il);
+        }
 
-    if (hparams.n_expert_used == 1) {
-        // avoid returning a non-contiguous tensor
-        moe_out = ggml_cont(ctx0, moe_out);
+        ggml_build_forward_expand(gf, experts);
+
+        ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+
+        assert(n_expert_used > 0);
+
+        // order the views before the adds
+        for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+            cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+
+            ggml_build_forward_expand(gf, cur_experts[i]);
+        }
+
+        // aggregate experts
+        // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
+        //       to avoid potentially a large number of add nodes during warmup
+        //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
+        moe_out = cur_experts[0];
+
+        for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+            moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+
+            ggml_build_forward_expand(gf, moe_out);
+        }
+
+        if (hparams.n_expert_used == 1) {
+            // avoid returning a non-contiguous tensor
+            moe_out = ggml_cont(ctx0, moe_out);
+        }
     }
 
     cb(moe_out, "ffn_moe_out", il);
