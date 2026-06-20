@@ -82,41 +82,46 @@ static const char * g_dump_names[] = {
 //   col1 = nextn(h_d, emb(w))  -> the HIT  draft (guess succ(w); next cycle processes w)
 // We argmax BOTH columns in the callback (synchronous, post-compute) so the loop needs NO separate
 // draft forward at all.
+// K=2 chain: capture BOTH the depth-1 draft ("nextn_draft-78") and the depth-2 chained draft
+// ("nextn_draft2-78"), argmaxed per column (up to 3 columns for the fused [a, d1, d2] verify batch).
+// Per column c the in-graph chain seeds from succ(token@c):
+//   col0 → miss path (next a = v),  col1 → 1-hit path (next a = w1),  col2 → 2-hit path (next a = w2)
+// so d1[c] = depth-1 draft for that path, d2[c] = depth-2 draft for that path.
 struct spec_cb_data {
     int         n_vocab = 0;
-    llama_token d0      = -1;   // argmax(col0) = miss draft
-    llama_token d1      = -1;   // argmax(col1) = hit  draft
-    bool        got     = false;
+    llama_token d1[3]   = { -1, -1, -1 }; // depth-1 draft argmax per column (nextn_draft-78)
+    llama_token d2[3]   = { -1, -1, -1 }; // depth-2 draft argmax per column (nextn_draft2-78)
+    bool        got1    = false;
+    bool        got2    = false;
 };
 
 static bool spec_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * d = (spec_cb_data *) user_data;
-    const bool want = (strcmp(t->name, "nextn_draft-78") == 0);
+    const bool want1 = (strcmp(t->name, "nextn_draft-78")  == 0);
+    const bool want2 = (strcmp(t->name, "nextn_draft2-78") == 0);
     if (ask) {
-        return want;
+        return want1 || want2;
     }
-    if (!want) {
+    if (!(want1 || want2)) {
         return true;
     }
     GGML_ASSERT(t->type == GGML_TYPE_F32);
     const int64_t nv   = t->ne[0]; // n_vocab
     const int64_t cols = t->ne[1];
-    static std::vector<float> col0, col1;
-    if ((int64_t) col0.size() != nv) { col0.resize(nv); col1.resize(nv); }
+    static std::vector<float> buf;
+    if ((int64_t) buf.size() != nv) { buf.resize(nv); }
     const bool is_host = ggml_backend_buffer_is_host(t->buffer);
-    auto load = [&](int c, std::vector<float> & dst) {
+    auto argmax_col = [&](int c) -> llama_token {
         if (is_host) {
             const float * base = (const float *) ((const uint8_t *) t->data + c * t->nb[1]);
-            for (int64_t i = 0; i < nv; ++i) { dst[i] = base[i]; }
-        } else {
-            ggml_backend_tensor_get(t, dst.data(), c * t->nb[1], nv * sizeof(float));
+            return argmax_logits(base, (int) nv);
         }
+        ggml_backend_tensor_get(t, buf.data(), c * t->nb[1], nv * sizeof(float));
+        return argmax_logits(buf.data(), (int) nv);
     };
-    load(0, col0);
-    d->d0 = argmax_logits(col0.data(), (int) nv);
-    if (cols > 1) { load(1, col1); d->d1 = argmax_logits(col1.data(), (int) nv); }
-    else          { d->d1 = d->d0; }
-    d->got = true;
+    llama_token * dst = want1 ? d->d1 : d->d2;
+    for (int c = 0; c < 3; ++c) { dst[c] = (c < cols) ? argmax_col(c) : -1; }
+    if (want1) { d->got1 = true; } else { d->got2 = true; }
     return true;
 }
 
@@ -276,13 +281,13 @@ int main(int argc, char ** argv) {
             bool eog = llama_vocab_is_eog(vocab, a);
             while (!eog && (int) gen.size() < cap && p + 2 < n_ctx) {
                 llama_memory_seq_rm(mem, 0, p, -1);
-                spec_draft.got = false;
+                spec_draft.got1 = false;
                 llama_batch vb = llama_batch_init(2, 0, 1);
                 common_batch_add(vb, a, p,     {0}, true);
                 common_batch_add(vb, d, p + 1, {0}, true);
                 int rc = llama_decode(ctx, vb);
                 llama_batch_free(vb);
-                if (rc != 0 || !spec_draft.got) { fprintf(stderr, "\n[decode failed]\n"); break; }
+                if (rc != 0 || !spec_draft.got1) { fprintf(stderr, "\n[decode failed]\n"); break; }
                 const llama_token v = argmax_logits(llama_get_logits_ith(ctx, 0), n_vocab);
                 const llama_token w = argmax_logits(llama_get_logits_ith(ctx, 1), n_vocab);
                 if (v == d) {
@@ -290,13 +295,13 @@ int main(int argc, char ** argv) {
                     if (llama_vocab_is_eog(vocab, d)) { eog = true; fflush(stdout); break; }
                     gen.push_back(w); fputs(piece(w).c_str(), stdout); fflush(stdout);
                     if (llama_vocab_is_eog(vocab, w)) { eog = true; break; }
-                    a = w; d = spec_draft.d1; p += 2;
+                    a = w; d = spec_draft.d1[1]; p += 2;
                 } else {
                     llama_memory_seq_rm(mem, 0, p + 1, -1);
                     a = v; p += 1;
                     gen.push_back(v); fputs(piece(v).c_str(), stdout); fflush(stdout);
                     if (llama_vocab_is_eog(vocab, v)) { eog = true; break; }
-                    d = spec_draft.d0;
+                    d = spec_draft.d1[0];
                 }
             }
             // commit the trailing emitted token cleanly (the last emit is uncommitted until the next
@@ -466,80 +471,108 @@ int main(int argc, char ** argv) {
         llama_token a = argmax_logits(llama_get_logits_ith(ctx, -1), n_vocab);
         int         p = n_prompt;
 
-        int n_acc_draft  = 0; // drafts accepted (== bonus tokens)
-        int n_draft      = 0; // drafts proposed
-        int n_forwards   = 0; // model forwards in the timed loop
+        int n_acc_draft   = 0; // depth-1 drafts accepted
+        int n_draft       = 0; // depth-1 drafts proposed (== forwards in steady state)
+        int n_acc_draft2  = 0; // depth-2 drafts accepted
+        int n_draft2      = 0; // depth-2 drafts proposed (only after a depth-1 hit)
+        int n_forwards    = 0; // model forwards in the timed loop
 
         llama_memory_t mem = llama_get_memory(ctx);
 
         const int64_t t_start_us = ggml_time_us();
 
-        // Seed: no real draft for the first cycle. Use a dummy d=a; the first fused [a,a] almost always
-        // misses (emits the true v) and the in-graph col0 yields the real next draft. No seed forward.
-        llama_token d = a;
+        // Seed: no real drafts for the first cycle. Use dummy d1=d2=a; the first fused [a,a,a] almost
+        // always misses on d1 (emits the true v) and the in-graph col0 chain yields the real next
+        // drafts. No seed forward.
+        llama_token d1 = a, d2 = a;
         bool eog = llama_vocab_is_eog(vocab, a);
         out_tokens.push_back(a); rec('s', p); // a came straight from the prompt argmax = confirmed
 
         while (!eog && (int) out_tokens.size() < n_gen) {
-            // Fused VERIFY+DRAFT, batch [a, d] @ [p, p+1], all-positions output, nextn engaged. ONE forward:
-            //   main logits@0 = v (true succ of a);  main logits@1 = w (true succ of d; bonus iff d==v)
-            //   in-graph nextn col0 = nextn(h_a, emb(v)) = MISS draft;  col1 = nextn(h_d, emb(w)) = HIT draft
-            // So the verify forward ALSO produces the NEXT cycle's draft -> no separate draft forward,
-            // and the graph topology never changes -> no reuse thrash.
+            // Fused VERIFY + 2-deep DRAFT, batch [a, d1, d2] @ [p, p+1, p+2], all-positions output,
+            // nextn engaged (depth-1 + chained depth-2). ONE forward:
+            //   main logits@0 = v  (true succ of a)
+            //   main logits@1 = w1 (true succ of d1; valid iff d1 accepted)
+            //   main logits@2 = w2 (true succ of d2; valid iff d1 AND d2 accepted)
+            //   in-graph chain per column c (seeds from succ(token@c)):
+            //     c=0 → miss path (next a=v),  c=1 → 1-hit path (next a=w1),  c=2 → 2-hit path (next a=w2)
+            //     spec_draft.d1[c] = depth-1 draft for that path,  d2[c] = depth-2 draft.
+            // So this verify forward ALSO produces the next cycle's 2-deep draft chain -> no separate
+            // draft forward, graph topology never changes (no reuse thrash).
             llama_memory_seq_rm(mem, 0, p, -1); // drop a's stale slot (and above) to re-commit cleanly
 
-            spec_draft.got = false;
-            llama_batch vb = llama_batch_init(2, 0, 1);
-            common_batch_add(vb, a, p,     { 0 }, /*logits=*/true);
-            common_batch_add(vb, d, p + 1, { 0 }, /*logits=*/true);
+            spec_draft.got1 = spec_draft.got2 = false;
+            llama_batch vb = llama_batch_init(3, 0, 1);
+            common_batch_add(vb, a,  p,     { 0 }, /*logits=*/true);
+            common_batch_add(vb, d1, p + 1, { 0 }, /*logits=*/true);
+            common_batch_add(vb, d2, p + 2, { 0 }, /*logits=*/true);
             const int rc = llama_decode(ctx, vb);
             llama_batch_free(vb);
             n_forwards++;
             if (rc != 0) { LOG_ERR("%s: fused decode failed @ pos %d\n", __func__, p); return 1; }
-            if (!spec_draft.got) { LOG_ERR("%s: draft not captured in fused forward\n", __func__); return 1; }
+            const bool no_step2 = getenv("LLAMA_MTP_NO_STEP2") != nullptr; // per-forward isolation measurement
+            if (!spec_draft.got1 || (!no_step2 && !spec_draft.got2)) { LOG_ERR("%s: drafts not captured in fused forward\n", __func__); return 1; }
 
             const llama_token v  = argmax_logits(llama_get_logits_ith(ctx, 0), n_vocab); // true succ(a)
-            const llama_token w  = argmax_logits(llama_get_logits_ith(ctx, 1), n_vocab); // true succ(d)
-            const llama_token d0 = spec_draft.d0; // nextn(h_a, emb(v)) = miss draft (guess succ(v))
-            const llama_token d1 = spec_draft.d1; // nextn(h_d, emb(w)) = hit  draft (guess succ(w))
+            const llama_token w1 = argmax_logits(llama_get_logits_ith(ctx, 1), n_vocab); // true succ(d1)
+            const llama_token w2 = argmax_logits(llama_get_logits_ith(ctx, 2), n_vocab); // true succ(d2)
 
             n_draft++;
-            if (v == d) {
-                // hit: d confirmed @ p+1; w (true succ(d)) also confirmed (prefix [a,d] is correct).
+            if (d1 == v) {
+                // depth-1 hit: d1 confirmed @ p+1 (== true succ(a)); w1 = true succ(d1) is now valid.
                 n_acc_draft++;
-                out_tokens.push_back(d); rec('d', p + 1);
-                if (llama_vocab_is_eog(vocab, d)) { eog = true; break; }
-                out_tokens.push_back(w); rec('w', p + 2);
-                dump_bonus(p + 2, llama_get_logits_ith(ctx, 1)); // float-vs-logic diagnostic for the bonus
-                if (llama_vocab_is_eog(vocab, w)) { eog = true; break; }
-                a = w; d = d1; p = p + 2; // d1 = hit draft = guess succ(w) @ p+3
+                out_tokens.push_back(d1); rec('d', p + 1);
+                if (llama_vocab_is_eog(vocab, d1)) { eog = true; break; }
+                n_draft2++; // a depth-2 draft was on the table (only meaningful once d1 hit)
+                if (d2 == w1) {
+                    // depth-2 hit: d2 confirmed @ p+2 (== true succ(d1)); w2 = true succ(d2) is bonus.
+                    n_acc_draft2++;
+                    out_tokens.push_back(d2); rec('d', p + 2);
+                    if (llama_vocab_is_eog(vocab, d2)) { eog = true; break; }
+                    out_tokens.push_back(w2); rec('w', p + 3);
+                    dump_bonus(p + 3, llama_get_logits_ith(ctx, 2));
+                    if (llama_vocab_is_eog(vocab, w2)) { eog = true; break; }
+                    a = w2; d1 = spec_draft.d1[2]; d2 = spec_draft.d2[2]; p = p + 3;
+                } else {
+                    // depth-1 hit only: d2 wrong -> drop its slot. True next is w1 @ p+2 (bonus).
+                    out_tokens.push_back(w1); rec('w', p + 2);
+                    dump_bonus(p + 2, llama_get_logits_ith(ctx, 1));
+                    llama_memory_seq_rm(mem, 0, p + 2, -1);
+                    if (llama_vocab_is_eog(vocab, w1)) { eog = true; break; }
+                    a = w1; d1 = spec_draft.d1[1]; d2 = spec_draft.d2[1]; p = p + 2;
+                }
             } else {
-                // miss: a confirmed @ p; d wrong -> drop its slot. True next is v @ p+1.
+                // miss: a confirmed @ p; d1,d2 wrong -> drop their slots. True next is v @ p+1.
                 llama_memory_seq_rm(mem, 0, p + 1, -1);
                 a = v; p = p + 1;
                 out_tokens.push_back(a); rec('v', p);
                 if (llama_vocab_is_eog(vocab, a)) { eog = true; break; }
-                d = d0; // d0 = miss draft = guess succ(v) @ p+2
+                d1 = spec_draft.d1[0]; d2 = spec_draft.d2[0];
             }
+            if (no_step2) { d2 = d1; } // step2 not built -> keep col2 a valid token for per-forward timing
         }
 
         const int64_t t_end_us = ggml_time_us();
         const double  secs     = (t_end_us - t_start_us) / 1e6;
         const int     n_out    = (int) out_tokens.size();
         const double  tps      = secs > 0 ? n_out / secs : 0.0;
-        const double  real_alpha = n_draft > 0 ? (double) n_acc_draft / (double) n_draft : 0.0;
+        const double  alpha1 = n_draft  > 0 ? (double) n_acc_draft  / (double) n_draft  : 0.0;
+        const double  alpha2 = n_draft2 > 0 ? (double) n_acc_draft2 / (double) n_draft2 : 0.0;
 
-        printf("\n========== MTP self-spec (K=1) ==========\n");
-        printf("prompt tokens         : %d\n", n_prompt);
-        printf("generated tokens      : %d\n", n_out);
-        printf("model forwards        : %d\n", n_forwards);
-        printf("tokens / forward      : %.4f\n", n_forwards > 0 ? (double) n_out / n_forwards : 0.0);
-        printf("drafts proposed       : %d\n", n_draft);
-        printf("drafts accepted       : %d\n", n_acc_draft);
-        printf("REAL-LOOP ALPHA       : %.4f\n", real_alpha);
-        printf("decode wall-clock (s) : %.4f\n", secs);
-        printf("DECODE t/s (spec-ON)  : %.4f\n", tps);
-        printf("=========================================\n");
+        printf("\n========== MTP self-spec (K=2 chain) ==========\n");
+        printf("prompt tokens          : %d\n", n_prompt);
+        printf("generated tokens       : %d\n", n_out);
+        printf("model forwards         : %d\n", n_forwards);
+        printf("tokens / forward       : %.4f\n", n_forwards > 0 ? (double) n_out / n_forwards : 0.0);
+        printf("depth-1 drafts (prop)  : %d\n", n_draft);
+        printf("depth-1 drafts (acc)   : %d\n", n_acc_draft);
+        printf("ALPHA-1 (depth-1)      : %.4f\n", alpha1);
+        printf("depth-2 drafts (prop)  : %d\n", n_draft2);
+        printf("depth-2 drafts (acc)   : %d\n", n_acc_draft2);
+        printf("ALPHA-2 (depth-2|1-hit): %.4f\n", alpha2);
+        printf("decode wall-clock (s)  : %.4f\n", secs);
+        printf("DECODE t/s (spec-ON)   : %.4f\n", tps);
+        printf("===============================================\n");
 
         // emit the spec-ON token stream for the lossless diff
         const char * sf = getenv("LLAMA_MTP_SPEC_OUT");

@@ -213,11 +213,23 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
     // per-layer transformer body (deepseek2 MLA + MoE). Factored into a lambda so the nextn
     // (MTP) block can re-run it with the layer-78 weights. apply_out_ids is true ONLY for the
     // last main layer; the nextn call passes false so it operates on all positions.
-    auto run_layer = [&](ggml_tensor * inpL_in, int il, bool apply_out_ids) -> ggml_tensor * {
+    auto run_layer = [&](ggml_tensor * inpL_in, int il, bool apply_out_ids, bool skip_attn = false) -> ggml_tensor * {
         ggml_tensor * inpSA = inpL_in;
+        ggml_tensor * cur   = inpSA;
+        ggml_tensor * ffn_inp;
 
+      if (skip_attn) {
+        // MTP depth-2 chained draft (see the mtp_spec branch below): skip this block's MLA entirely
+        // so it performs NO KV write. The layer-78 KV for committed tokens — written by the depth-1
+        // nextn pass — therefore stays uncorrupted, preserving the depth-1 acceptance α exactly. The
+        // FFN/MoE sublayer alone refines the injected hidden (= the depth-1 nextn block output) plus
+        // emb(d1) into the depth-2 draft. Self-spec is lossless regardless of draft quality (the
+        // verify forward's main logits are ground truth), so dropping attention here only trades
+        // depth-2 draft α — never the emitted token stream.
+        ffn_inp = inpSA;
+      } else {
         // norm
-        ggml_tensor * cur = build_norm(inpL_in, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
+        cur = build_norm(inpL_in, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
         // self_attention (MLA with absorption)
@@ -317,7 +329,8 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+        ffn_inp = ggml_add(ctx0, cur, inpSA);
+      } // end else (skip_attn)
         cb(ffn_inp, "ffn_inp", il);
 
         cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
@@ -498,7 +511,29 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
             // self-spec: leave res->t_logits = the TARGET logits untouched (verify reads them via
             // llama_get_logits_ith). The draft logits are read back through cb_eval by name, so they
             // only need to be part of the compute graph — expand them explicitly.
-            ggml_build_forward_expand(gf, draft);
+            ggml_build_forward_expand(gf, draft); // depth-1 draft = "nextn_draft-78"
+
+          // LLAMA_MTP_NO_STEP2: isolate the per-forward cost of the 3rd verify column from the cost
+          // of the depth-2 nextn traversal. When set, skip building step2 entirely (graph keeps the
+          // 3 columns + single nextn pass) so a spec run measures the 3-col, depth-1-only per-forward.
+          if (getenv("LLAMA_MTP_NO_STEP2") == nullptr) {
+            // ---- depth-2 chained draft (K=2): one more nextn step, weight-tied to the same layer-78
+            // module, reusing the depth-1 block output `blk` as the hidden and emb(argmax(depth-1
+            // draft)) as the token embedding. run_layer is called with skip_attn=true so this step
+            // writes NO layer-78 KV — the depth-1 pass's committed-token KV stays clean (preserves
+            // α1). Per column c the chain seeds from succ(token@c): col0→miss path, col1→1-hit path,
+            // col2→2-hit path. Lossless regardless: verify catches every wrong draft.
+            ggml_tensor * ids2  = ggml_argmax(ctx0, draft);                         // {N} I32
+            ggml_tensor * emb2  = ggml_get_rows(ctx0, model.tok_embd, ids2);        // {n_embd, N}
+            ggml_tensor * e2    = build_norm(emb2, model.layers[il_nextn].nextn.enorm, NULL, LLM_NORM_RMS, -1);
+            ggml_tensor * hn2   = build_norm(blk,  model.layers[il_nextn].nextn.hnorm, NULL, LLM_NORM_RMS, -1);
+            ggml_tensor * x2    = ggml_mul_mat(ctx0, model.layers[il_nextn].nextn.eh_proj, ggml_concat(ctx0, e2, hn2, 0)); // {n_embd, N}
+            ggml_tensor * blk2  = run_layer(x2, il_nextn, /*apply_out_ids=*/ false, /*skip_attn=*/ true);
+            ggml_tensor * o2    = build_norm(blk2, model.layers[il_nextn].nextn.shared_head_norm, NULL, LLM_NORM_RMS, -1);
+            ggml_tensor * draft2 = ggml_mul_mat(ctx0, model.output, o2);            // {n_vocab, N}
+            cb(draft2, "nextn_draft2", il_nextn);
+            ggml_build_forward_expand(gf, draft2);
+          } // end LLAMA_MTP_NO_STEP2 gate
         } else {
             // probe: overwrite the logits readback with the draft logits, shape {n_vocab, N} == n_outputs=N
             res->t_logits = draft;
