@@ -1442,6 +1442,26 @@ UseGgmlGemm2:;
     }
 }
 
+// [NODE_PROF] env-gated per-op wall-time accounting on the CPU backend (thread 0 only).
+// Decomposes the in-graph_compute cmp_cpu time (measured 21.3ms/token vs 9.4ms kernel floor
+// on GLM-5.2 -ot split) into per-op buckets incl. barrier waits. Zero cost when unset.
+static int ggml_node_prof_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char * e = getenv("GGML_CPU_NODE_PROF"); v = e ? atoi(e) : 0; }
+    return v;
+}
+static int64_t   g_nodeprof_us [GGML_OP_COUNT];
+static int64_t   g_nodeprof_cnt[GGML_OP_COUNT];
+static int64_t   g_nodeprof_mmid_us[4]; // 0=gate 1=up 2=down 3=other (MUL_MAT_ID by weight name)
+static long long g_nodeprof_graphs;
+
+// [MMID_SPREAD] per-thread entry/exit stamps for MUL_MAT_ID (written by each thread inside the
+// op, read by thread 0 after the trailing barrier). Splits the observed in-node inflation into
+// start-stagger vs uniform-slow vs straggler-finish. Gated by GGML_CPU_NODE_PROF (piggyback).
+static int64_t g_mmid_tin [128];
+static int64_t g_mmid_tout[128];
+static int64_t g_sp_stagger, g_sp_work, g_sp_workmax, g_sp_finish, g_sp_n;
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1534,6 +1554,8 @@ static void ggml_compute_forward_mul_mat_id(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    if (ggml_node_prof_enabled() && ith < 128) g_mmid_tin[ith] = ggml_time_us();
 
     const enum ggml_type type = src0->type;
 
@@ -1695,6 +1717,8 @@ static void ggml_compute_forward_mul_mat_id(
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
     }
+
+    if (ggml_node_prof_enabled() && ith < 128) g_mmid_tout[ith] = ggml_time_us();
 }
 
 /////////////////////////////////
@@ -3008,6 +3032,35 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+static void ggml_node_prof_add(const struct ggml_tensor * node, int64_t us) {
+    g_nodeprof_us [node->op] += us;
+    g_nodeprof_cnt[node->op] += 1;
+    if (node->op == GGML_OP_MUL_MAT_ID && node->src[0]) {
+        const char * n = node->src[0]->name;
+        int b = 3;
+        if      (strstr(n, "gate")) b = 0;
+        else if (strstr(n, "up"))   b = 1;
+        else if (strstr(n, "down")) b = 2;
+        g_nodeprof_mmid_us[b] += us;
+    }
+}
+static void ggml_node_prof_dump(void) {
+    fprintf(stderr, "[NODE_PROF] over %lld graphs, us/graph (cnt/graph):\n", g_nodeprof_graphs);
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        if (g_nodeprof_cnt[i] == 0) continue;
+        fprintf(stderr, "  %-16s %9.1f us (%5.2f)\n", ggml_op_name((enum ggml_op) i),
+            (double) g_nodeprof_us[i] / g_nodeprof_graphs, (double) g_nodeprof_cnt[i] / g_nodeprof_graphs);
+    }
+    fprintf(stderr, "  MUL_MAT_ID split: gate=%.1f up=%.1f down=%.1f other=%.1f us/graph\n",
+        (double) g_nodeprof_mmid_us[0] / g_nodeprof_graphs, (double) g_nodeprof_mmid_us[1] / g_nodeprof_graphs,
+        (double) g_nodeprof_mmid_us[2] / g_nodeprof_graphs, (double) g_nodeprof_mmid_us[3] / g_nodeprof_graphs);
+    if (g_sp_n > 0) {
+        fprintf(stderr, "  MMID_SPREAD over %lld ops: start_stagger=%.1f work_avg=%.1f work_max=%.1f finish_spread=%.1f us\n",
+            g_sp_n, (double) g_sp_stagger / g_sp_n, (double) g_sp_work / g_sp_n,
+            (double) g_sp_workmax / g_sp_n, (double) g_sp_finish / g_sp_n);
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3036,6 +3089,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    const int node_prof = ggml_node_prof_enabled() && state->ith == 0;
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3047,6 +3102,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        const int64_t np_t0 = node_prof ? ggml_time_us() : 0;
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
@@ -3065,6 +3122,39 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+
+        // [NODE_PROF] time includes this node's compute + trailing barrier (= critical path of the node)
+        if (node_prof) {
+            ggml_node_prof_add(node, ggml_time_us() - np_t0);
+            // [MMID_SPREAD] all threads passed the trailing barrier => tin/tout arrays complete
+            if (node->op == GGML_OP_MUL_MAT_ID) {
+                const int nthr = params.nth < 128 ? params.nth : 128;
+                int64_t min_in = g_mmid_tin[0], max_in = g_mmid_tin[0];
+                int64_t min_out = g_mmid_tout[0], max_out = g_mmid_tout[0];
+                int64_t sum_work = 0, max_work = 0;
+                for (int t = 0; t < nthr; t++) {
+                    const int64_t w = g_mmid_tout[t] - g_mmid_tin[t];
+                    sum_work += w; if (w > max_work) max_work = w;
+                    if (g_mmid_tin[t]  < min_in)  min_in  = g_mmid_tin[t];
+                    if (g_mmid_tin[t]  > max_in)  max_in  = g_mmid_tin[t];
+                    if (g_mmid_tout[t] < min_out) min_out = g_mmid_tout[t];
+                    if (g_mmid_tout[t] > max_out) max_out = g_mmid_tout[t];
+                }
+                g_sp_stagger += max_in - min_in;
+                g_sp_work    += sum_work / nthr;
+                g_sp_workmax += max_work;
+                g_sp_finish  += max_out - min_out;
+                g_sp_n++;
+            }
+        }
+    }
+
+    if (node_prof) {
+        // dump interval: GGML_CPU_NODE_PROF > 1 is used as the graph interval (default 2048)
+        const int every = ggml_node_prof_enabled() > 1 ? ggml_node_prof_enabled() : 2048;
+        if (++g_nodeprof_graphs % every == 0) {
+            ggml_node_prof_dump();
         }
     }
 

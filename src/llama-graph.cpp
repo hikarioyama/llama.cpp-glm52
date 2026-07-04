@@ -873,6 +873,7 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_mtp_draft_ids = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -910,6 +911,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
+    }
+    if (t_mtp_draft_ids != nullptr) {
+        ggml_set_output(t_mtp_draft_ids);
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {

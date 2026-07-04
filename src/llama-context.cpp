@@ -175,6 +175,13 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        // env: LLAMA_DUAL_GRAPH_CACHE — per-variant sched + gf_res cache (MTP self-spec)
+        const char * LLAMA_DUAL_GRAPH_CACHE = getenv("LLAMA_DUAL_GRAPH_CACHE");
+        dual_graph_cache = LLAMA_DUAL_GRAPH_CACHE ? (atoi(LLAMA_DUAL_GRAPH_CACHE) != 0) : false;
+        if (dual_graph_cache) {
+            LLAMA_LOG_WARN("%s: LLAMA_DUAL_GRAPH_CACHE enabled (per-variant graph/sched cache)\n", __func__);
+        }
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -374,6 +381,23 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // final graph-reuse summary (instrumentation)
+    if (gr_calls > 0) {
+        graph_reuse_report(true);
+    }
+
+    // LLAMA_DUAL_GRAPH_CACHE: restore the slot-0 sched into the canonical member so
+    // the buffer-size bookkeeping below (compared against backend_buf_exp_size, which
+    // was computed for slot 0) refers to the right sched, and so all per-variant
+    // scheds/results destruct cleanly.
+    if (dual_graph_cache && dual_active_variant != UINT32_MAX && dual_active_variant != 0) {
+        dual_sched [dual_active_variant] = std::move(sched);
+        dual_gf_res[dual_active_variant] = std::move(gf_res_prev);
+        sched       = std::move(dual_sched [0]);
+        gf_res_prev = std::move(dual_gf_res[0]);
+        dual_active_variant = 0;
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -399,6 +423,24 @@ void llama_context::sched_reserve() {
     }
 
     sched_need_reserve = false;
+
+    // LLAMA_DUAL_GRAPH_CACHE: a reserve rebuilds the canonical sched/gf_res from
+    // scratch. The canonical members may currently alias a non-slot-0 variant
+    // (steady-state invariant), so first restore slot 0 into the canonical members,
+    // then drop ALL per-variant caches. They will be lazily rebuilt+re-split on
+    // their next decode, guaranteeing each variant's warm state is fresh & correct.
+    if (dual_graph_cache) {
+        if (dual_active_variant != UINT32_MAX && dual_active_variant != 0 && dual_sched[0]) {
+            sched       = std::move(dual_sched [0]);
+            gf_res_prev = std::move(dual_gf_res[0]);
+        }
+        for (uint32_t v = 0; v < DUAL_GRAPH_N_VARIANTS; ++v) {
+            dual_sched[v].reset();
+            dual_gf_res[v].reset();
+            dual_reserved[v] = false;
+        }
+        dual_active_variant = UINT32_MAX;
+    }
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -827,6 +869,18 @@ float * llama_context::get_logits_ith(int32_t i) {
     }
 }
 
+const llama_token * llama_context::get_mtp_draft_ids() {
+    output_reorder();
+
+    return mtp_n_draft_ids > 0 ? mtp_draft_ids.data() : nullptr;
+}
+
+int32_t llama_context::get_mtp_n_draft_ids() {
+    output_reorder();
+
+    return mtp_n_draft_ids;
+}
+
 float * llama_context::get_embeddings() {
     output_reorder();
 
@@ -1175,11 +1229,88 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+void llama_context::graph_reuse_report(bool final_summary) {
+    const uint64_t denom = gr_calls ? gr_calls : 1;
+    const double hit_rate = 100.0 * (double) gr_reuse_hits / (double) denom;
+    LLAMA_LOG_INFO(
+        "[GRAPH_REUSE]%s calls=%llu reuse_hits=%llu reuse_miss=%llu hit_rate=%.1f%% (variant histogram: v0=%llu v1=%llu)\n",
+        final_summary ? " FINAL" : "",
+        (unsigned long long) gr_calls,
+        (unsigned long long) gr_reuse_hits,
+        (unsigned long long) gr_reuse_miss,
+        hit_rate,
+        (unsigned long long) gr_variant_hist[0],
+        (unsigned long long) gr_variant_hist[1]);
+}
+
+// [LLAMA_CTX_PROF] Patch C: env-gated host wall-time buckets for the decode critical path.
+//   build   = graph reuse-check / build / alloc (process_ubatch)
+//   setinp  = res->set_inputs (process_ubatch)
+//   compute = graph_compute submit (process_ubatch, async submit; host wall only)
+//   readback= decode logits/embd/mtp get_async issue (llama_context::decode)
+//   getlog  = ctx->synchronize() host block inside llama_get_logits*/mtp accessors
+//            (tests the hypothesis that mtp-alpha's argmax blocks here waiting on the GPU)
+// Host wall time only; no added synchronize/flush. Dumped every 64 process_ubatch calls.
+static const int ctxp_on = []{ const char * e = getenv("LLAMA_CTX_PROF"); return e ? atoi(e) : 0; }();
+static int64_t   ctxp_build=0, ctxp_setinp=0, ctxp_compute=0, ctxp_readback=0, ctxp_getlog=0;
+static long long ctxp_calls=0;
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // ---- LLAMA_DUAL_GRAPH_CACHE: select per-variant sched + gf_res ----
+    // The active variant is the same key graph_params() uses (graph_variant). We
+    // move the per-variant owning slot into the canonical `sched`/`gf_res_prev`
+    // members so every downstream call site (which uses those members directly)
+    // operates on this variant's warm sched + pre-built+pre-split graph. The
+    // steady-state invariant is: the canonical members HOLD the active variant,
+    // and that variant's slot is empty; the inactive variant lives in its slot.
+    // This is LOSSLESS: it only changes which pre-built+pre-split graph/sched is
+    // computed, never the math. When the flag is off none of this runs and
+    // behavior is byte-identical to upstream.
+    const uint32_t cur_variant = (llama_mtp_get_draft_mode() ? 1u : 0u) % DUAL_GRAPH_N_VARIANTS;
+    if (dual_graph_cache) {
+        // sched_reserve() (called on the decode path before us, and which drops the
+        // dual caches whenever a reserve actually happens) guarantees the canonical
+        // sched/gf_res are valid and reserved here. Slot 0 adopts that canonical
+        // (worst-case-reserved) sched the first time: variant 0 keeps the properly
+        // reserved galloc; other variants get fresh lazily-reserved scheds. The
+        // canonical members keep holding slot 0's state (active = 0) at this point.
+        if (!dual_reserved[0]) {
+            dual_reserved[0] = true;
+            dual_active_variant = 0;
+        }
+
+        if (cur_variant != dual_active_variant) {
+            // stash the currently-active variant's warm state back into its slot
+            if (dual_active_variant != UINT32_MAX) {
+                dual_sched [dual_active_variant] = std::move(sched);
+                dual_gf_res[dual_active_variant] = std::move(gf_res_prev);
+            }
+
+            // lazily create the target variant's sched + result on first touch.
+            // a fresh sched lazily reserves its galloc compute buffers on its first
+            // alloc_graph (its first decode is a MISS); subsequent same-variant
+            // decodes HIT the warm split plan.
+            if (!dual_sched[cur_variant]) {
+                const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+                const size_t   max_nodes = this->graph_max_nodes(n_tokens);
+                dual_sched [cur_variant].reset(ggml_backend_sched_new(
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+                dual_gf_res[cur_variant].reset(new llm_graph_result(max_nodes));
+                dual_reserved[cur_variant] = true;
+            }
+
+            // swap the target variant into the canonical members
+            sched       = std::move(dual_sched [cur_variant]);
+            gf_res_prev = std::move(dual_gf_res[cur_variant]);
+            dual_active_variant = cur_variant;
+        }
     }
 
     auto * res = gf_res_prev.get();
@@ -1189,7 +1320,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // ---- instrumentation: count whether the can_reuse fast-path is taken ----
+    // env-gated (LLAMA_GRAPH_REUSE_PROF=1): counters + periodic report only when requested
+    // (2026-07-04 adversarial review: this block was always-on, contradicting the
+    //  "all instrumentation is env-gated" invariant of this fork)
+    static const bool gr_prof = [] { const char * e = getenv("LLAMA_GRAPH_REUSE_PROF"); return e && atoi(e); }();
+    const bool gr_hit = !graph_reuse_disable && res->can_reuse(gparams);
+    if (gr_prof) {
+        gr_calls++;
+        if (gr_hit) { gr_reuse_hits++; } else { gr_reuse_miss++; }
+        gr_variant_hist[cur_variant]++;
+        if ((gr_calls & 63) == 0) {
+            graph_reuse_report(false);
+        }
+    }
+
+    int64_t cp_t0 = ctxp_on ? ggml_time_us() : 0;
+    int64_t cp_build=0, cp_setinp=0, cp_compute=0;
+
+    if (gr_hit) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1225,6 +1374,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    if (ctxp_on) { int64_t t = ggml_time_us(); cp_build = t - cp_t0; cp_t0 = t; }
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1235,11 +1386,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (ctxp_on) { int64_t t = ggml_time_us(); cp_setinp = t - cp_t0; cp_t0 = t; }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (ctxp_on) {
+        cp_compute = ggml_time_us() - cp_t0;
+        ctxp_build += cp_build; ctxp_setinp += cp_setinp; ctxp_compute += cp_compute; ctxp_calls++;
+        if (ctxp_calls % 64 == 0) {
+            fprintf(stderr, "[CTX_PROF] call#%lld us/call over %lld: build=%.2f setinp=%.2f compute=%.2f readback=%.2f getlogits_sync=%.2f (this call build=%lld setinp=%lld compute=%lld)\n",
+                ctxp_calls, ctxp_calls,
+                (double)ctxp_build/ctxp_calls, (double)ctxp_setinp/ctxp_calls, (double)ctxp_compute/ctxp_calls,
+                (double)ctxp_readback/ctxp_calls, (double)ctxp_getlog/ctxp_calls,
+                (long long)cp_build, (long long)cp_setinp, (long long)cp_compute);
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -1615,6 +1780,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     embd_seq.clear();
     output_swaps.clear();
+    mtp_draft_ids.assign(n_outputs_all, LLAMA_TOKEN_NULL);
+    mtp_n_draft_ids = 0;
 
     sched_reserve();
 
@@ -1736,10 +1903,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto * t_logits = res->get_logits();
         auto * t_embd   = cparams.embeddings ? res->get_embd() : nullptr;
+        auto * t_mtp_draft_ids = res->get_mtp_draft_ids();
 
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
         }
+
+        int64_t cp_r0 = ctxp_on ? ggml_time_us() : 0;
 
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
@@ -1755,6 +1925,28 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
         }
+
+        // extract optional GLM nextn draft token IDs ({N} I32) produced by in-graph argmax
+        if (t_mtp_draft_ids && n_outputs > 0) {
+            GGML_ASSERT(t_mtp_draft_ids->type == GGML_TYPE_I32);
+            GGML_ASSERT(ggml_is_contiguous(t_mtp_draft_ids));
+
+            const int64_t n_ids = ggml_nelements(t_mtp_draft_ids);
+            GGML_ASSERT(n_ids >= n_outputs);
+            GGML_ASSERT(n_outputs_prev + n_outputs <= (int64_t) mtp_draft_ids.size());
+
+            ggml_backend_t backend_mtp = ggml_backend_sched_get_tensor_backend(sched.get(), t_mtp_draft_ids);
+            GGML_ASSERT(backend_mtp != nullptr);
+
+            ggml_backend_tensor_get_async(
+                    backend_mtp, t_mtp_draft_ids,
+                    mtp_draft_ids.data() + n_outputs_prev,
+                    0,
+                    n_outputs*sizeof(llama_token));
+            mtp_n_draft_ids = std::max<int32_t>(mtp_n_draft_ids, (int32_t) (n_outputs_prev + n_outputs));
+        }
+
+        if (ctxp_on) ctxp_readback += ggml_time_us() - cp_r0;
 
         // extract embeddings
         if (embd.data && t_embd && n_outputs > 0) {
@@ -2039,6 +2231,10 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd.data[i0*n_embd + k], embd.data[i1*n_embd + k]);
             }
+        }
+
+        if (mtp_n_draft_ids > 0) {
+            std::swap(mtp_draft_ids[i0], mtp_draft_ids[i1]);
         }
 
         if (!sampling.samplers.empty()) {
@@ -3407,13 +3603,17 @@ void llama_synchronize(llama_context * ctx) {
 }
 
 float * llama_get_logits(llama_context * ctx) {
+    int64_t s0 = ctxp_on ? ggml_time_us() : 0;
     ctx->synchronize();
+    if (ctxp_on) ctxp_getlog += ggml_time_us() - s0;
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+    int64_t s0 = ctxp_on ? ggml_time_us() : 0;
     ctx->synchronize();
+    if (ctxp_on) ctxp_getlog += ggml_time_us() - s0;
 
     float * res = nullptr;
 
@@ -3424,6 +3624,20 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+const llama_token * llama_mtp_get_draft_ids(llama_context * ctx) {
+    int64_t s0 = ctxp_on ? ggml_time_us() : 0;
+    ctx->synchronize();
+    if (ctxp_on) ctxp_getlog += ggml_time_us() - s0;
+
+    return ctx->get_mtp_draft_ids();
+}
+
+int32_t llama_mtp_n_draft_ids(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_mtp_n_draft_ids();
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

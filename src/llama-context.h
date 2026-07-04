@@ -80,6 +80,9 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    const llama_token * get_mtp_draft_ids();
+    int32_t get_mtp_n_draft_ids();
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -278,6 +281,10 @@ private:
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
 
+    // GLM nextn in-graph argmax output, populated only when the graph exposes it.
+    std::vector<llama_token> mtp_draft_ids;
+    int32_t mtp_n_draft_ids = 0;
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
@@ -318,6 +325,34 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+
+    // ---- env: LLAMA_DUAL_GRAPH_CACHE (per-variant graph-reuse cache) ----
+    // When enabled, the MTP self-spec decode alternates between two graph
+    // topologies (graph_variant 0 = main/verify, 1 = draft-only) every forward.
+    // The stock single `sched` + single `gf_res_prev` can never reuse across the
+    // alternation, so the graph is rebuilt + re-split every token. We give each
+    // variant its OWN sched (warm split plan / galloc) and its OWN gf_res, and
+    // retarget the active `sched` / `gf_res_prev` per variant in process_ubatch.
+    // When the flag is unset, all of this is dormant and behavior is byte-identical.
+    static constexpr uint32_t DUAL_GRAPH_N_VARIANTS = 2;
+
+    bool dual_graph_cache = false;                                  // env flag latched at ctor
+
+    // owning storage for the per-variant scheds/results. When the flag is on,
+    // `sched`/`gf_res_prev` are made to alias one of these slots (raw retarget),
+    // so all existing call sites that use `sched`/`gf_res_prev` keep working.
+    ggml_backend_sched_ptr dual_sched   [DUAL_GRAPH_N_VARIANTS];
+    llm_graph_result_ptr   dual_gf_res  [DUAL_GRAPH_N_VARIANTS];
+    bool                   dual_reserved[DUAL_GRAPH_N_VARIANTS] = { false, false };
+    uint32_t               dual_active_variant = UINT32_MAX;        // which slot `sched` currently aliases
+
+    // ---- instrumentation (always on): graph-reuse hit/miss counter ----
+    uint64_t gr_calls       = 0;
+    uint64_t gr_reuse_hits  = 0;
+    uint64_t gr_reuse_miss  = 0;
+    uint64_t gr_variant_hist[DUAL_GRAPH_N_VARIANTS] = { 0, 0 };
+
+    void graph_reuse_report(bool final_summary);
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

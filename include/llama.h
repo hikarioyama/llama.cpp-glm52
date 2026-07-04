@@ -981,6 +981,9 @@ extern "C" {
     //       draft forward (must be set before each draft decode; data must outlive the decode).
     LLAMA_API void llama_mtp_set_draft_mode(bool draft_only);
     LLAMA_API void llama_mtp_set_hidden(const float * data, int64_t n_embd, int64_t n_tokens);
+    // Optional GLM nextn in-graph argmax output from the last decode.
+    LLAMA_API const llama_token * llama_mtp_get_draft_ids(struct llama_context * ctx);
+    LLAMA_API int32_t llama_mtp_n_draft_ids(struct llama_context * ctx);
 
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results

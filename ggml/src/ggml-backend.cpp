@@ -1561,11 +1561,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     static long long gk_in_gpu=0, gk_in_cpu=0, gk_cmp_cpu=0, gk_cmp_gpu=0;
     long long tk_in_gpu=0, tk_in_cpu=0, tk_cmp_cpu=0, tk_cmp_gpu=0;
 
+    // [SPLIT_PROF] Patch A: env-gated per-split-index wall time (host wall only, no extra sync).
+    // Attributes per-token overhead to individual splits (= layers) so we can see which of the
+    // ~61 splits accumulate the ms. Records backend + first-node name (layer id) once per index.
+    static const int dbg_split_prof = []{ const char * e = getenv("GGML_SCHED_SPLIT_PROF"); return e ? atoi(e) : 0; }();
+    static std::vector<int64_t>      sp_us;       // cumulative us per split index
+    static std::vector<const char *> sp_backend;  // backend name per split index (recorded once)
+    static std::vector<const char *> sp_node;     // first node name per split index (recorded once)
+    static long long                 sp_calls = 0;
+    if (dbg_split_prof && (int) sp_us.size() != sched->n_splits) {
+        sp_us.assign(sched->n_splits, 0);
+        sp_backend.assign(sched->n_splits, nullptr);
+        sp_node.assign(sched->n_splits, nullptr);
+    }
+    // [INPUT_PROF] Patch B: env-gated input-copy sub-phase wall time (host wall only, no extra sync).
+    //   ids = ids readback (get_async+sync) + used-expert bitset walk
+    //   exp = copy_experts used-expert H2D
+    //   gen = generic async copy + WAR/event host waits
+    static const int dbg_input_prof = []{ const char * e = getenv("GGML_SCHED_INPUT_PROF"); return e ? atoi(e) : 0; }();
+    // v2: gen split into war (WAR wait), gen_wait (dependency wait on input backend),
+    //     gen_copy (blocking copy + dst sync) so pageable-copy tax is separable from real waits.
+    static int64_t   gb_ids=0, gb_exp=0, gb_gen=0, gb_war=0, gb_gen_wait=0;
+    static long long ib_calls=0;
+    int64_t cb_ids=0, cb_exp=0, cb_gen=0, cb_war=0, cb_gen_wait=0;
+
+    // [ASYNC_H2D] env-gated port of upstream #20793 (3fc4e1052): CPU->CUDA async H2D copies
+    // replace the per-input host syncs with one sync before the input loop and one before compute
+    // (the "saaasg" pattern). Removes the ~20 gen_sp host-blocks/token. When unset, the code path
+    // is byte-identical to the fork's pre-merge behavior (for clean A/B against SPLIT/INPUT_PROF).
+    // The CUDA side (ggml_backend_cuda_cpy_tensor_async) reads the same env to enable copy_from_host.
+    static const bool async_h2d = []{ const char * e = getenv("GGML_SCHED_ASYNC_H2D"); return e && atoi(e); }();
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         int64_t tk_t0 = (dbg_sync >= 3) ? ggml_time_us() : 0;
+        int64_t a_t0  = dbg_split_prof ? ggml_time_us() : 0;
+
+        // [ASYNC_H2D] #20793: single sync before the input loop replaces the removed per-input syncs
+        if (async_h2d) {
+            ggml_backend_synchronize(split_backend);
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1579,20 +1616,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                     if (dbg_sync && dbg_is_gpu(split_backend)) c_inp++;
-                } else {
+                } else if (!async_h2d || !split_backend->iface.cpy_tensor_async) {
+                    // [ASYNC_H2D] #20793: with async H2D the pre-loop sync covers this; skip the per-input host block
                     ggml_backend_synchronize(split_backend);
                     if (dbg_sync && dbg_is_gpu(split_backend)) c_inp++;
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                if (async_h2d) {
+                    ggml_backend_tensor_copy_async(input_backend, split_backend, input, input_cpy);
+                } else {
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
+                int64_t bt_war = dbg_input_prof ? ggml_time_us() : 0;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                     // event_wait is a stream wait (not a host block) => not counted
-                } else {
+                } else if (!async_h2d || !split_backend->iface.cpy_tensor_async) {
+                    // [ASYNC_H2D] #20793: with async H2D the pre-loop sync provides WAR protection; skip
                     ggml_backend_synchronize(split_backend);
                     if (dbg_sync && dbg_is_gpu(split_backend)) c_war++;
                 }
+                if (dbg_input_prof) cb_war += ggml_time_us() - bt_war;
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
@@ -1623,6 +1668,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
 
+                    int64_t bt_ids = dbg_input_prof ? ggml_time_us() : 0;
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
@@ -1642,6 +1688,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         prev_ids_tensor = ids_tensor;
                     }
+                    if (dbg_input_prof) cb_ids += ggml_time_us() - bt_ids;
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -1658,6 +1705,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_end);
                     };
 
+                    int64_t bt_exp = dbg_input_prof ? ggml_time_us() : 0;
                     int id = 0;
                     while (!ggml_bitset_get(used_ids.data(), id)) {
                         id++;
@@ -1681,11 +1729,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                    if (dbg_input_prof) cb_exp += ggml_time_us() - bt_exp;
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+                    int64_t bt_gen = dbg_input_prof ? ggml_time_us() : 0;
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
+                        if (dbg_input_prof) cb_gen_wait += ggml_time_us() - bt_gen;
                         if (dbg_sync && dbg_is_gpu(input_backend)) c_gen_ib++;
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1696,8 +1747,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
+                    if (dbg_input_prof) cb_gen += ggml_time_us() - bt_gen;
                 }
             }
+        }
+
+        // [ASYNC_H2D] #20793: single sync before compute ensures all async input copies completed
+        if (async_h2d) {
+            ggml_backend_synchronize(split_backend);
         }
 
         if (dbg_sync >= 3) {
@@ -1754,6 +1811,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
+        }
+
+        if (dbg_split_prof) {
+            sp_us[split_id] += ggml_time_us() - a_t0;
+            if (sp_backend[split_id] == nullptr) {
+                sp_backend[split_id] = ggml_backend_name(split_backend);
+                sp_node[split_id]    = split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "";
+            }
+        }
+    }
+
+    if (dbg_split_prof) {
+        sp_calls++;
+        if (sp_calls % 64 == 0) {
+            fprintf(stderr, "[SPLIT_PROF] over %lld calls, us/call per split index:\n", sp_calls);
+            for (int i = 0; i < (int) sp_us.size(); i++) {
+                fprintf(stderr, "  split#%02d %-10s %-28s %8.2f us/call\n",
+                    i, sp_backend[i] ? sp_backend[i] : "?",
+                    sp_node[i] ? sp_node[i] : "?", (double) sp_us[i] / sp_calls);
+            }
+        }
+    }
+
+    if (dbg_input_prof) {
+        gb_ids += cb_ids; gb_exp += cb_exp; gb_gen += cb_gen; gb_war += cb_war; gb_gen_wait += cb_gen_wait; ib_calls++;
+        if (ib_calls % 64 == 0) {
+            fprintf(stderr, "[INPUT_PROF] over %lld calls us/call: ids_readback+walk=%.2f expert_H2D=%.2f WAR=%.2f gen_wait(dep)=%.2f gen_copy=%.2f TOT=%.2f\n",
+                ib_calls, (double)gb_ids/ib_calls, (double)gb_exp/ib_calls, (double)gb_war/ib_calls,
+                (double)gb_gen_wait/ib_calls, (double)(gb_gen-gb_gen_wait)/ib_calls,
+                (double)(gb_ids+gb_exp+gb_gen+gb_war)/ib_calls);
         }
     }
 
@@ -1843,6 +1930,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // keep stock behavior (no events allocated, zero risk of regression).
     static const bool moe_split_events = []{
         if (getenv("LLAMA_MOE_CTL")) return true; // runtime-tunable split: always provision events
+        // [SCHED_EVENTS] standalone gate (2026-07-04): provision events at n_copies==1 without
+        // any of the MOE_CPU_SPLIT graph-side effects. Converts WAR host-blocking syncs
+        // (measured 7.3ms/token on GLM-5.2 -ot split) into non-blocking stream waits.
+        const char * ev = getenv("GGML_SCHED_EVENTS"); if (ev && atoi(ev) > 0) return true;
         const char * e = getenv("LLAMA_MOE_CPU_SPLIT"); return e && atoi(e) > 0;
     }();
     for (int b = 0; b < n_backends; b++) {

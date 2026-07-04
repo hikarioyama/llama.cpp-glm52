@@ -8,6 +8,11 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
     // MoE parameters
     ml.get_key(LLM_KV_EXPERT_COUNT,                hparams.n_expert);
     ml.get_key(LLM_KV_EXPERT_USED_COUNT,           hparams.n_expert_used);
+    // EXPERIMENT (top-k routing speed lever): force n_expert_used at load so cmp_cpu scales ~k/8.
+    if (const char * e = getenv("LLAMA_N_EXPERT_USED")) {
+        hparams.n_expert_used = (uint32_t) atoi(e);
+        LLAMA_LOG_WARN("%s: OVERRIDE n_expert_used = %u (LLAMA_N_EXPERT_USED)\n", __func__, hparams.n_expert_used);
+    }
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
     ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
@@ -428,8 +433,11 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
     //   * LLAMA_MTP_SPEC   : keep res->t_logits = the TARGET logits (verify needs them) and only
     //                        expose the draft logits as the named tensor "nextn_draft-78", which the
     //                        self-spec loop reads back via cb_eval. Used by the K=1 self-spec decode.
+    //   * LLAMA_MTP_INGRAPH_ARGMAX : with LLAMA_MTP_SPEC, expose only argmax(draft logits) as a
+    //                        small {N} I32 output so the decode can use the async scheduler path.
     const bool mtp_probe = getenv("LLAMA_MTP_PROBE") != nullptr;
     const bool mtp_spec  = getenv("LLAMA_MTP_SPEC")  != nullptr;
+    const bool mtp_ingraph_argmax = getenv("LLAMA_MTP_INGRAPH_ARGMAX") != nullptr;
     // (il_nextn declared above)
     // Engage the nextn branch ONLY on all-positions-output forwards, where inp_out_ids is the
     // identity so h_prenorm keeps its full n_tokens width and matches emb_shift (built from
@@ -496,9 +504,16 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
 
         if (mtp_spec) {
             // self-spec: leave res->t_logits = the TARGET logits untouched (verify reads them via
-            // llama_get_logits_ith). The draft logits are read back through cb_eval by name, so they
-            // only need to be part of the compute graph — expand them explicitly.
-            ggml_build_forward_expand(gf, draft);
+            // llama_get_logits_ith). Default/A-B path reads draft logits back through cb_eval by
+            // name. The in-graph argmax path exposes only the two draft token IDs as a tiny output.
+            if (mtp_ingraph_argmax) {
+                ggml_tensor * draft_ids = ggml_argmax(ctx0, draft); // {N} I32, argmax over vocab per col
+                cb(draft_ids, "nextn_draft_ids", il_nextn);
+                res->t_mtp_draft_ids = draft_ids;
+                ggml_build_forward_expand(gf, draft_ids);
+            } else {
+                ggml_build_forward_expand(gf, draft);
+            }
         } else {
             // probe: overwrite the logits readback with the draft logits, shape {n_vocab, N} == n_outputs=N
             res->t_logits = draft;
@@ -508,4 +523,3 @@ llama_model_glm_dsa::graph::graph(const llama_model & model, const llm_graph_par
 
     ggml_build_forward_expand(gf, cur);
 }
-

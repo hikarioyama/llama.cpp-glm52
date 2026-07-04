@@ -18,7 +18,10 @@
 #include "chat.h"
 #include "log.h"
 #include "llama.h"
+#include "ggml.h"
 #include "ggml-backend.h"
+
+#include <cstdint>
 
 #include <algorithm>
 #include <cmath>
@@ -40,6 +43,27 @@ static int argmax_logits(const float * logits, int n_vocab) {
         }
     }
     return best;
+}
+
+// top-K token ids of the logits distribution (descending by logit), into out[0..K-1].
+// Single linear pass with a tiny insertion buffer (K <= 8), so O(n_vocab * K).
+static void topk_ids(const float * logits, int n_vocab, int K, llama_token * out) {
+    float best_v[8];
+    for (int k = 0; k < K; ++k) { out[k] = -1; best_v[k] = -INFINITY; }
+    for (int v = 0; v < n_vocab; ++v) {
+        const float val = logits[v];
+        if (val <= best_v[K - 1]) {
+            continue;
+        }
+        int j = K - 1;
+        while (j > 0 && val > best_v[j - 1]) {
+            best_v[j] = best_v[j - 1];
+            out[j]    = out[j - 1];
+            --j;
+        }
+        best_v[j] = val;
+        out[j]    = v;
+    }
 }
 
 // rank of token `tok` in the logits distribution (0 == top-1)
@@ -69,7 +93,7 @@ static const char * g_dump_names[] = {
     "nextn_x-78", "nextn_block-78", "nextn_o-78",
 };
 
-// ---- self-spec (gate 3): capture the nextn DRAFT logits each forward via cb_eval ----
+// ---- self-spec (gate 3): capture nextn DRAFT logits via cb_eval, or draft IDs via in-graph argmax ----
 // The in-graph nextn branch (LLAMA_MTP_SPEC) leaves res->t_logits = the TARGET logits and exposes
 // the draft logits as the tensor "nextn_draft-78" of shape {n_vocab, N}. The nextn emb input is the
 // batch shifted left by one column, so for a fused batch [a, d]:
@@ -81,7 +105,8 @@ static const char * g_dump_names[] = {
 //   col0 = nextn(h_a, emb(v))  -> the MISS draft (guess succ(v); next cycle processes v)
 //   col1 = nextn(h_d, emb(w))  -> the HIT  draft (guess succ(w); next cycle processes w)
 // We argmax BOTH columns in the callback (synchronous, post-compute) so the loop needs NO separate
-// draft forward at all.
+// draft forward at all. With LLAMA_MTP_INGRAPH_ARGMAX=1, the graph does this argmax itself and the
+// loop reads only the tiny draft ID output after llama_decode.
 struct spec_cb_data {
     int         n_vocab = 0;
     llama_token d0      = -1;   // argmax(col0) = miss draft
@@ -165,6 +190,102 @@ static bool dump_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     return true;
 }
 
+// ---- LEAP instrumentation dump (GLM-5.2 look-ahead-routing / adaptive-k decision data) ----------
+// When GLM_LEAP_DUMP=<path> is set, capture per (decode-token, layer):
+//   'F'  ffn_inp                router INPUT residual (pre-norm)  fp16  [n_embd=6144]  (validation key)
+//   'H'  l_out                  post-MoE residual hidden          fp16  [n_embd=6144]  (prefetch trigger)
+//   'S'  ffn_moe_probs_biased   256 biased selection scores       f32   [n_expert=256] (sigmoid+sel bias)
+//   'T'  ffn_moe_topk           realized top-8 expert IDs         i32   [n_expert_used=8] (ground truth)
+// Binary record layout (little-endian): [u8 tag][i32 tok][i32 layer][i32 n][n x payload].
+// Runs in GENERATE mode (spec-OFF, 1 token / forward) so column 0 == the decoded token. Timing here is
+// IRRELEVANT (the device->host copies serialize the scheduler); a separate dumps-off run measures t/s.
+// The router at layer L consumes RMSNorm(ffn_inp(L)), NOT l_out(L). 'F' is therefore the EXACT router
+// input: the offline router reproduction is validated by router_L('F'(L)) == 'S'(L)/'T'(L) at d=0,
+// then trusted on the stale signal ('F' or 'H' at L-d) for the recall@k LEAP1 measurement.
+struct leap_dump_ctx {
+    FILE * f         = nullptr;
+    int    cur_tok   = -1;
+    bool   active    = false; // only true during the per-token decode loop (false during prefill)
+    int    max_layer = 77;    // main MoE layers 0..77; nextn (78) is not built in generate mode anyway
+    long   n_rec     = 0;
+};
+
+static int leap_layer_suffix(const char * name, const char * pre) {
+    const size_t pl = strlen(pre);
+    if (strncmp(name, pre, pl) != 0 || name[pl] != '-') {
+        return -1;
+    }
+    char * e   = nullptr;
+    long   il  = strtol(name + pl + 1, &e, 10);
+    return (*e == '\0' && il >= 0) ? (int) il : -1;
+}
+
+static void leap_write_rec(leap_dump_ctx * d, char tag, int layer, int n,
+                           const void * payload, size_t elem) {
+    const uint8_t t = (uint8_t) tag;
+    fwrite(&t,          1,           1, d->f);
+    fwrite(&d->cur_tok, sizeof(int), 1, d->f);
+    fwrite(&layer,      sizeof(int), 1, d->f);
+    fwrite(&n,          sizeof(int), 1, d->f);
+    fwrite(payload,     elem,        (size_t) n, d->f);
+    d->n_rec++;
+}
+
+static bool leap_dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * d = (leap_dump_ctx *) user_data;
+    const char * name = t->name;
+    const int il_f = leap_layer_suffix(name, "ffn_inp");
+    const int il_h = leap_layer_suffix(name, "l_out");
+    const int il_s = leap_layer_suffix(name, "ffn_moe_probs_biased");
+    const int il_t = leap_layer_suffix(name, "ffn_moe_topk");
+    const bool want = (il_f >= 0) || (il_h >= 0) || (il_s >= 0) || (il_t >= 0);
+    if (ask) {
+        return want;
+    }
+    if (!want || d == nullptr || d->f == nullptr || !d->active) {
+        return true;
+    }
+
+    // generate mode runs 1 token / forward -> column 0 is the decoded token.
+    const int64_t ne0     = t->ne[0];
+    const bool    is_host = ggml_backend_buffer_is_host(t->buffer);
+
+    if (il_f >= 0) {
+        if (il_f > d->max_layer) { return true; }
+        GGML_ASSERT(t->type == GGML_TYPE_F32);
+        std::vector<float> col(ne0);
+        if (is_host) { const float * b = (const float *) t->data; for (int64_t i = 0; i < ne0; ++i) col[i] = b[i]; }
+        else         { ggml_backend_tensor_get(t, col.data(), 0, ne0 * sizeof(float)); }
+        std::vector<ggml_fp16_t> h(ne0);
+        ggml_fp32_to_fp16_row(col.data(), h.data(), ne0);
+        leap_write_rec(d, 'F', il_f, (int) ne0, h.data(), sizeof(ggml_fp16_t));
+    } else if (il_h >= 0) {
+        if (il_h > d->max_layer) { return true; }
+        GGML_ASSERT(t->type == GGML_TYPE_F32);
+        std::vector<float> col(ne0);
+        if (is_host) { const float * b = (const float *) t->data; for (int64_t i = 0; i < ne0; ++i) col[i] = b[i]; }
+        else         { ggml_backend_tensor_get(t, col.data(), 0, ne0 * sizeof(float)); }
+        std::vector<ggml_fp16_t> h(ne0);
+        ggml_fp32_to_fp16_row(col.data(), h.data(), ne0);
+        leap_write_rec(d, 'H', il_h, (int) ne0, h.data(), sizeof(ggml_fp16_t));
+    } else if (il_s >= 0) {
+        if (il_s > d->max_layer) { return true; }
+        GGML_ASSERT(t->type == GGML_TYPE_F32);
+        std::vector<float> col(ne0);
+        if (is_host) { const float * b = (const float *) t->data; for (int64_t i = 0; i < ne0; ++i) col[i] = b[i]; }
+        else         { ggml_backend_tensor_get(t, col.data(), 0, ne0 * sizeof(float)); }
+        leap_write_rec(d, 'S', il_s, (int) ne0, col.data(), sizeof(float));
+    } else { // il_t >= 0
+        if (il_t > d->max_layer) { return true; }
+        GGML_ASSERT(t->type == GGML_TYPE_I32);
+        std::vector<int32_t> col(ne0);
+        if (is_host) { const int32_t * b = (const int32_t *) t->data; for (int64_t i = 0; i < ne0; ++i) col[i] = b[i]; }
+        else         { ggml_backend_tensor_get(t, col.data(), 0, ne0 * sizeof(int32_t)); }
+        leap_write_rec(d, 'T', il_t, (int) ne0, col.data(), sizeof(int32_t));
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     common_params params;
 
@@ -183,15 +304,26 @@ int main(int argc, char ** argv) {
 
     const bool probe_mode = getenv("LLAMA_MTP_PROBE") != nullptr;
     const bool spec_mode  = getenv("LLAMA_MTP_SPEC")  != nullptr;
+    // BETA HEADROOM probe: in PROBE mode, additionally accumulate the cumulative top-K acceptance
+    // of the 2-ahead nextn head (acc@1/2/4/8). This is the max β a width-K tree-verify could reach.
+    const bool beta_probe = getenv("LLAMA_MTP_BETA_PROBE") != nullptr;
+    const bool spec_ingraph_argmax = spec_mode && getenv("LLAMA_MTP_INGRAPH_ARGMAX") != nullptr;
     // interactive chat driven by the MTP self-spec loop (needs the spec graph, i.e. LLAMA_MTP_SPEC).
     const bool chat_mode  = getenv("LLAMA_MTP_CHAT")  != nullptr;
 
-    if (!params.enable_mtp) {
-        LOG_ERR("%s: this tool must be run with --enable-mtp\n", __func__);
+    // GLM_LEAP_DUMP runs a plain spec-OFF generate (N=1/forward) and does not need the nextn block;
+    // every other mode requires --enable-mtp so the nextn tensors + layer-78 KV exist.
+    if (!params.enable_mtp && getenv("GLM_LEAP_DUMP") == nullptr) {
+        LOG_ERR("%s: this tool must be run with --enable-mtp (or set GLM_LEAP_DUMP for a spec-OFF dump)\n", __func__);
         return 1;
     }
     if (probe_mode && spec_mode) {
         LOG_ERR("%s: set only ONE of LLAMA_MTP_PROBE / LLAMA_MTP_SPEC\n", __func__);
+        return 1;
+    }
+    if (beta_probe && !probe_mode) {
+        LOG_ERR("%s: LLAMA_MTP_BETA_PROBE requires LLAMA_MTP_PROBE=1 (it reuses the probe's all-logits "
+                "draft-logits prefill over S)\n", __func__);
         return 1;
     }
     if (chat_mode && !spec_mode) {
@@ -219,12 +351,47 @@ int main(int argc, char ** argv) {
         params.warmup = false;
     }
 
-    // gate-3 self-spec: capture the nextn draft logits each forward via cb_eval
+    // gate-3 self-spec: default/A-B path captures draft logits via cb_eval. The in-graph argmax
+    // path leaves cb_eval unset so the scheduler can stay on its async path.
     spec_cb_data spec_draft;
     if (spec_mode) {
-        params.cb_eval = spec_eval_cb;
-        params.cb_eval_user_data = &spec_draft;
         params.warmup = false;
+        if (!spec_ingraph_argmax) {
+            params.cb_eval = spec_eval_cb;
+            params.cb_eval_user_data = &spec_draft;
+        }
+    }
+
+    // LEAP instrumentation dump: per-token per-layer hidden + routing, for the look-ahead-routing
+    // (recall@k) and adaptive-k decisions. GENERATE mode only (spec-OFF, 1 token / forward).
+    leap_dump_ctx leap;
+    const bool leap_mode = getenv("GLM_LEAP_DUMP") != nullptr;
+    if (leap_mode) {
+        if (probe_mode || spec_mode) {
+            LOG_ERR("%s: GLM_LEAP_DUMP requires GENERATE mode (unset LLAMA_MTP_PROBE / LLAMA_MTP_SPEC)\n", __func__);
+            return 1;
+        }
+        // The realized top-8 ground truth ('T') and selection scores ('S') are only valid at the
+        // model's true routing. The fork's own top-k overrides would silently corrupt them, making
+        // the recall denominator wrong (review SEV-4). Refuse to run rather than dump bad science.
+        if (getenv("LLAMA_N_EXPERT_USED") || getenv("LLAMA_MOE_CTL")) {
+            LOG_ERR("%s: GLM_LEAP_DUMP refuses to run with LLAMA_N_EXPERT_USED / LLAMA_MOE_CTL set "
+                    "(they change the realized routing). Unset them and rerun.\n", __func__);
+            return 1;
+        }
+        const char * path = getenv("GLM_LEAP_DUMP"); // the env VALUE is the output path
+        leap.f = fopen(path, "wb");
+        if (leap.f == nullptr) {
+            LOG_ERR("%s: cannot open leap dump file '%s'\n", __func__, path);
+            return 1;
+        }
+        if (const char * ml = getenv("GLM_LEAP_MAXL")) {
+            leap.max_layer = atoi(ml);
+        }
+        params.cb_eval           = leap_dump_cb;
+        params.cb_eval_user_data = &leap;
+        params.warmup            = false;
+        LOG_INF("%s: LEAP dump -> %s (max_layer=%d)\n", __func__, path, leap.max_layer);
     }
 
     common_init_result_ptr llama_init = common_init_from_params(params);
@@ -235,8 +402,65 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Attach a persistent threadpool (ported from tools/completion/completion.cpp).
+    // Without this, --cpu-mask/--cpu-strict/--poll are parsed but never applied: the CPU
+    // backend falls back to per-graph disposable threadpools (23 pthread create/join per
+    // CPU split in no-OMP builds) and unpinned omp teams in OMP builds.
+    // 2026-07-04 adversarial-review finding (critical #1/#2 of remaining-levers lens).
+    {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev == nullptr) {
+            LOG_ERR("%s: no CPU backend found\n", __func__);
+            return 1;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(cpu_dev);
+        auto * ggml_threadpool_new_fn  = (decltype(ggml_threadpool_new)  *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+
+        struct ggml_threadpool_params tpp_batch = ggml_threadpool_params_from_cpu_params(params.cpuparams_batch);
+        struct ggml_threadpool_params tpp       = ggml_threadpool_params_from_cpu_params(params.cpuparams);
+
+        set_process_priority(params.cpuparams.priority);
+
+        struct ggml_threadpool * threadpool_batch = NULL;
+        if (!ggml_threadpool_params_match(&tpp, &tpp_batch)) {
+            threadpool_batch = ggml_threadpool_new_fn(&tpp_batch);
+            if (!threadpool_batch) {
+                LOG_ERR("%s: batch threadpool create failed : n_threads %d\n", __func__, tpp_batch.n_threads);
+                return 1;
+            }
+            tpp.paused = true; // start the non-batch threadpool in the paused state
+        }
+
+        struct ggml_threadpool * threadpool = ggml_threadpool_new_fn(&tpp);
+        if (!threadpool) {
+            LOG_ERR("%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
+            return 1;
+        }
+
+        llama_attach_threadpool(ctx, threadpool, threadpool_batch);
+        LOG_INF("%s: persistent threadpool attached (n_threads=%d, poll=%d, strict=%d)\n",
+            __func__, tpp.n_threads, (int) tpp.poll, (int) tpp.strict_cpu);
+    }
+
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
+
+    auto refresh_spec_draft = [&]() -> bool {
+        if (!spec_ingraph_argmax) {
+            return spec_draft.got;
+        }
+
+        const llama_token * ids = llama_mtp_get_draft_ids(ctx);
+        const int32_t n_ids = llama_mtp_n_draft_ids(ctx);
+        if (ids == nullptr || n_ids <= 0) {
+            return false;
+        }
+
+        spec_draft.d0  = ids[0];
+        spec_draft.d1  = n_ids > 1 ? ids[1] : ids[0];
+        spec_draft.got = true;
+        return true;
+    };
 
     if (chat_mode) {
         // ===================================================================
@@ -282,7 +506,7 @@ int main(int argc, char ** argv) {
                 common_batch_add(vb, d, p + 1, {0}, true);
                 int rc = llama_decode(ctx, vb);
                 llama_batch_free(vb);
-                if (rc != 0 || !spec_draft.got) { fprintf(stderr, "\n[decode failed]\n"); break; }
+                if (rc != 0 || !refresh_spec_draft()) { fprintf(stderr, "\n[decode failed]\n"); break; }
                 const llama_token v = argmax_logits(llama_get_logits_ith(ctx, 0), n_vocab);
                 const llama_token w = argmax_logits(llama_get_logits_ith(ctx, 1), n_vocab);
                 if (v == d) {
@@ -496,7 +720,7 @@ int main(int argc, char ** argv) {
             llama_batch_free(vb);
             n_forwards++;
             if (rc != 0) { LOG_ERR("%s: fused decode failed @ pos %d\n", __func__, p); return 1; }
-            if (!spec_draft.got) { LOG_ERR("%s: draft not captured in fused forward\n", __func__); return 1; }
+            if (!refresh_spec_draft()) { LOG_ERR("%s: draft not captured in fused forward\n", __func__); return 1; }
 
             const llama_token v  = argmax_logits(llama_get_logits_ith(ctx, 0), n_vocab); // true succ(a)
             const llama_token w  = argmax_logits(llama_get_logits_ith(ctx, 1), n_vocab); // true succ(d)
@@ -598,7 +822,10 @@ int main(int argc, char ** argv) {
                 break;
             }
             llama_batch b1 = llama_batch_get_one(&tokens.back(), 1);
-            if (llama_decode(ctx, b1) != 0) {
+            leap.cur_tok = g; leap.active = leap_mode; // dump this token's per-layer routing (no-op if !leap_mode)
+            const int dret = llama_decode(ctx, b1);
+            leap.active = false;
+            if (dret != 0) {
                 LOG_ERR("%s: decode failed at gen step %d\n", __func__, g);
                 return 1;
             }
@@ -666,6 +893,11 @@ int main(int argc, char ** argv) {
         int   n_cmp = 0;
         int   hist[6] = {0, 0, 0, 0, 0, 0}; // rank buckets: 0,1,2,3,4, >=5
         bool  any_nan = false;
+        // BETA HEADROOM: cumulative top-K acceptance of the 2-ahead head.
+        // acc@K counts positions where the true 2-ahead token S[i+2] is within the head's top-K.
+        // Determined exactly by rank_of (rank < K). acc@1 must reproduce ALPHA (~0.72) as a sanity check.
+        long  acc_at[4] = {0, 0, 0, 0}; // K = 1, 2, 4, 8
+        static const int BETA_K[4] = {1, 2, 4, 8};
         std::vector<std::string> examples;
 
         for (int i = 0; i <= N - 3; ++i) {
@@ -688,6 +920,13 @@ int main(int argc, char ** argv) {
             }
             const int r = rank_of(lg, n_vocab, truth);
             hist[r < 5 ? r : 5]++;
+
+            if (beta_probe) {
+                // exact top-K membership: true token is in top-K iff its rank < K.
+                for (int ki = 0; ki < 4; ++ki) {
+                    if (r < BETA_K[ki]) { acc_at[ki]++; }
+                }
+            }
 
             if ((int) examples.size() < 12) {
                 char buf_d[256], buf_t[256];
@@ -720,7 +959,47 @@ int main(int argc, char ** argv) {
         }
         printf("=======================================\n");
 
+        if (beta_probe) {
+            const double a1 = n_cmp > 0 ? (double) acc_at[0] / n_cmp : 0.0;
+            const double a2 = n_cmp > 0 ? (double) acc_at[1] / n_cmp : 0.0;
+            const double a4 = n_cmp > 0 ? (double) acc_at[2] / n_cmp : 0.0;
+            const double a8 = n_cmp > 0 ? (double) acc_at[3] / n_cmp : 0.0;
+            // This is the cumulative top-K acceptance ceiling of the 2-ahead head =
+            // the max β a tree-verify of width K could reach (teacher-forced, see caveat in report).
+            printf("[BETA_PROBE] positions=%d acc@1=%.4f acc@2=%.4f acc@4=%.4f acc@8=%.4f\n",
+                   n_cmp, a1, a2, a4, a8);
+            // also stderr so it survives stdout redirection / is greppable
+            fprintf(stderr,
+                   "[BETA_PROBE] positions=%d acc@1=%.4f acc@2=%.4f acc@4=%.4f acc@8=%.4f\n",
+                   n_cmp, a1, a2, a4, a8);
+
+            // a few top-8 candidate sets vs truth, as a qualitative eyeball of the tree width needed
+            printf("\n[BETA_PROBE] example top-8 candidate sets (2-ahead head) vs truth:\n");
+            for (int i = 0, shown = 0; i <= N - 3 && shown < 8; ++i, ++shown) {
+                const float * lg = llama_get_logits_ith(ctx, i);
+                if (lg == nullptr) { break; }
+                llama_token tk[8];
+                topk_ids(lg, n_vocab, 8, tk);
+                const llama_token truth = S[i + 2];
+                const int r = rank_of(lg, n_vocab, truth);
+                char buf[64];
+                printf("  i=%-4d truth=%-7d rank=%-3d  top8=[", i, truth, r);
+                for (int k = 0; k < 8; ++k) {
+                    printf("%s%d", k ? "," : "", tk[k]);
+                }
+                int nt = llama_token_to_piece(vocab, truth, buf, sizeof(buf), 0, true);
+                printf("]  truth='%.*s'  %s\n", nt > 0 ? nt : 0, buf, r < 8 ? "(in top8)" : "(MISS>8)");
+            }
+        }
+
         llama_batch_free(batch);
+    }
+
+    if (leap.f != nullptr) {
+        fflush(leap.f);
+        fclose(leap.f);
+        leap.f = nullptr;
+        LOG_INF("%s: LEAP dump complete: %ld records written\n", __func__, leap.n_rec);
     }
 
     llama_backend_free();

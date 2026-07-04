@@ -79,6 +79,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -3178,11 +3179,25 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
 
-    if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+    // [ASYNC_H2D] env-gated port of upstream #20793 (3fc4e1052). Only when GGML_SCHED_ASYNC_H2D=1
+    // do we enable the CPU->CUDA (host-to-device) async copy path; unset => byte-identical to the
+    // fork's prior CUDA-to-CUDA-only behavior. The scheduler (ggml-backend.cpp) reads the same env.
+    static const bool async_h2d_env = []{ const char * e = getenv("GGML_SCHED_ASYNC_H2D"); return e && atoi(e); }();
+
+    // Enables async copies from CPU to CUDA, instead of only CUDA-to-CUDA.
+    // Excluding this path for HIP and MUSA as a precaution (upstream #20793): not beneficial for hip,
+    // and hip/musa stream behavior may not 1:1 match CUDA. Can be revisited separately.
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    const bool copy_from_host = false;
+#else
+    const bool copy_from_host = async_h2d_env && ggml_backend_buffer_is_host(buf_src) && ggml_backend_dev_type(backend_src->device) == GGML_BACKEND_DEVICE_TYPE_CPU;
+#endif
+
+    if (!(copy_from_host || ggml_backend_is_cuda(backend_src)) || !ggml_backend_is_cuda(backend_dst)) {
         return false;
     }
 
-    if (!ggml_backend_buffer_is_cuda(buf_src) || !ggml_backend_buffer_is_cuda(buf_dst)) {
+    if (!(copy_from_host || ggml_backend_buffer_is_cuda(buf_src)) || !ggml_backend_buffer_is_cuda(buf_dst)) {
         return false;
     }
 
@@ -3193,14 +3208,18 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
     ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
 
-    if (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device) {
+    if ((copy_from_host && cuda_ctx_dst->device != buf_ctx_dst->device) ||
+        (!copy_from_host && (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device))) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: backend and buffer devices do not match\n", __func__);
 #endif // NDEBUG
         return false;
     }
 
-    if (backend_src != backend_dst) {
+    if (copy_from_host) {
+        // [ASYNC_H2D] #20793: host -> device async copy on the dst stream
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyHostToDevice, cuda_ctx_dst->stream()));
+    } else if (backend_src != backend_dst) {
         // copy on src stream
         if (cuda_ctx_src->device == cuda_ctx_dst->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
@@ -4494,6 +4513,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    // [GRAPH_PROF] env-gated counters: is CUDA graph replay actually engaged in this regime
+    // (many splits/token + MTP alternating graphs)? No effect on execution when unset.
+    static const int dbg_graph_prof = []{ const char * e = getenv("GGML_CUDA_GRAPH_PROF"); return e ? atoi(e) : 0; }();
+    if (dbg_graph_prof) {
+        static long long n_call = 0, n_graph = 0, n_upd = 0, n_keys = 0;
+        static std::set<const void *> keys_seen;
+        n_call++;
+        if (use_cuda_graph) n_graph++;
+        if (use_cuda_graph && cuda_graph_update_required) n_upd++;
+        if (graph_key && keys_seen.insert(graph_key).second) n_keys = (long long) keys_seen.size();
+        if (n_call % 512 == 0) {
+            fprintf(stderr, "[GRAPH_PROF dev%d] calls=%lld replayed=%lld (%.0f%%) captures=%lld distinct_keys=%lld\n",
+                cuda_ctx->device, n_call, n_graph - n_upd, 100.0*(n_graph - n_upd)/n_call, n_upd, n_keys);
+        }
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
